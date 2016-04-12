@@ -7,7 +7,7 @@ char weekDay[][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 
 void setup () 
 {
-    Serial.begin(57600);
+    Serial.begin(115200);
     Wire.begin();
     rtc.begin();
 }

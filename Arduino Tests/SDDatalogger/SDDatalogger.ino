@@ -20,10 +20,14 @@
 
  */
 
+//SD
 #include <SPI.h>
 #include <SD.h>
 #include <stdint.h>
 #include <stdlib.h>
+//RTC
+#include <Wire.h>
+#include "Sodaq_DS3231.h"
 
 const int chipSelect = 8;
 
@@ -58,8 +62,28 @@ int logid = 0;
 char* logname;
 
 const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB
-const String CSV_HEADER_DATA = "VCC";
-const String CSV_HEADER_LOG = "TAG,MESSAGE";
+const String CSV_HEADER_DATA = "TIME (UTC+0),EPOCH,VCC";
+const String CSV_HEADER_LOG = "TIME (UTC+0),TAG,MESSAGE";
+
+String getTimeShort()
+{
+  DateTime now = rtc.now(); //get the current date-time
+  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
+             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
+             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC);
+  return a;
+}
+
+String getTime()
+{
+  DateTime now = rtc.now(); //get the current date-time
+  uint32_t ts = now.getEpoch(); //get UNIX time
+  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
+             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
+             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
+             "," + String(ts, DEC);
+  return a;
+}
 
 void initLogFile()
 {
@@ -81,14 +105,14 @@ void initLogFile()
 void log(String tag, String message, boolean id=true)
 {
   if (id)
-    Serial.print("[" + tag + "] " + message);
+    Serial.print(getTimeShort() + " [" + tag + "] " + message);
   else
     Serial.print(message);
   
   File dataFile = SD.open("log.csv", FILE_WRITE);
   if (dataFile) {
     if (id)
-      dataFile.print(tag + "," + message);
+      dataFile.print(getTimeShort() + "," + tag + "," + message);
     else
       dataFile.print(message);
     dataFile.close();
@@ -123,7 +147,7 @@ void incrementLogFile()
   logid = logid + 1;
   logln("LOG", "Incrementing log to " + String(logid));
   filesize = 0;
-
+  
   //Set logging string
   char lname[16];
   strcpy(lname, "data");
@@ -176,6 +200,12 @@ void setup()
     ; // wait for serial port to connect. Needed for Leonardo only
   }
 
+  // Init RTC
+  Wire.begin();
+  rtc.begin();
+  Serial.println("[TIME] Time is now " + getTime());
+
+  // Init Logging
   logname = (char*)malloc(16);
   strcpy(logname, "data.csv");
 
@@ -189,7 +219,8 @@ void loop()
   String dataString = "";
 
   // read three sensors and append to the string:
-  dataString += String(readVcc());
+  dataString += getTime();
+  dataString += "," + String(readVcc());
   //dataString += "," + String(analogRead(0));
 
   // rotate logs if filesize exceeds max size
