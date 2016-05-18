@@ -18,7 +18,7 @@
 
  This example code is in the public domain.
 
-*/
+ */
 
 //SD
 #include <SPI.h>
@@ -28,21 +28,10 @@
 //RTC
 #include <Wire.h>
 #include "Sodaq_DS3231.h"
-#include <SparkFunLSM9DS1.h>
-
-LSM9DS1 imu;
-#define LSM9DS1_M  0x1E // Would be 0x1C if SDO_M is LOW
-#define LSM9DS1_AG  0x6B // Would be 0x6A if SDO_AG is LOW
-// Earth's magnetic field varies by location. Add or subtract 
-// a declination to get a more accurate heading. Calculate 
-// your's here:
-// http://www.ngdc.noaa.gov/geomag-web/#declination
-#define DECLINATION 4 + 2/60 // Declination (degrees) in Austin, Texas
 
 const int chipSelect = 8;
 
-long readVcc()
-{
+long readVcc() {
   // Read 1.1V reference against AVcc
   // set the reference to Vcc and the measurement to the internal 1.1V reference
   #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
@@ -72,22 +61,32 @@ long filesize = 0;
 int logid = 0;
 char* logname;
 
-const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB
-const String CSV_HEADER_DATA = "TIME (UTC+0),EPOCH,VCC";
-const String CSV_HEADER_LOG = "TIME (UTC+0),TAG,MESSAGE";
-#define CLOCK_SYNC_COUNT 5;
+const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB  
+const String CSV_HEADER_DATA = "TIME (UTC+0),TIME DELTA,EPOCH,VCC";
 
-unsigned long millisOffset = 0;
+unsigned long long offset = 0;
 
-/*void syncClock()
+static void logln(String tag, String message, boolean newline=true)
+{
+  if (newline)
+    Serial.println(getTimeShort() + " [" + tag + "] " + message);
+  else
+    Serial.print(getTimeShort() + " [" + tag + "] " + message);
+}
+
+/*static void syncClock()
 {
   //Goal: compute the average millisecond discrepancy
+  logln("TIME", "Syncing high-accuracy clock...");
+  
   unsigned long zero = millis();
   unsigned int zero_ts = rtc.now().getEpoch();
   unsigned int next_ts = zero_ts;
   unsigned long long offset = 0;
-  for (unsigned int i=0; i<CLOCK_SYNC_COUNT; i++)
+  for (unsigned int i=0; i<10; i++)
   {
+    logln("TIME", "Sync pass " + String(i+1));
+    
     do
     {
       next_ts = rtc.now().getEpoch();
@@ -104,20 +103,28 @@ unsigned long millisOffset = 0;
     offset += millis() % 1000;
     next_ts = zero_ts;
   }
-  offset /= (CLOCK_SYNC_COUNT * 2);
+  offset /= (10 * 2);
   //unsigned long m = millis();
   //unsigned long millisSecond = m - (m % 1000);
   //millisOffset = offset + millisSecond;
-  millisOffset = offset;
-}
+  millisOffset = (offset + 15) % 1000;
+  logln("TIME", "Offset now " + String(millisOffset) + "ms");
+}*/
 
 String getTimeShort()
 {
   DateTime now = rtc.now(); //get the current date-time
+  unsigned long m = millis();
+  String dec = String((m) % 1000, DEC);
+  while (dec.length() < 3)
+    dec = "0" + dec;
+  String secs = String((m - (m % 1000)) / 1000, DEC);
+  while (secs.length() < 5)
+    secs = "0" + secs;
   String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
              (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
              (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) + 
-             "." + String((millis() - millisOffset) % 1000, DEC);
+             " " + secs + "." + dec;
   return a;
 }
 
@@ -125,103 +132,33 @@ String getTime()
 {
   DateTime now = rtc.now(); //get the current date-time
   uint32_t ts = now.getEpoch(); //get UNIX time
+  unsigned long m = millis();
+  String dec = String((m) % 1000, DEC);
+  String secs = String((m - (m % 1000)) / 1000, DEC);
   String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
              (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
              (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
-             "." + String((millis() - millisOffset) % 1000, DEC) + "," + 
-             String(ts, DEC) + "." + String((millis() - millisOffset) % 1000, DEC);
-  return a;
-}*/
-
-String getTimeShort()
-{
-  DateTime now = rtc.now(); //get the current date-time
-  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
-             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
-             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC);
+             "," + secs + "." + dec + "," + String(ts, DEC);
   return a;
 }
 
-String getTime()
-{
-  DateTime now = rtc.now(); //get the current date-time
-  uint32_t ts = now.getEpoch(); //get UNIX time
-  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
-             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
-             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
-             "," + String(ts, DEC);
-  return a;
-}
-
-/*void initIMU()
-{
-  // Before initializing the IMU, there are a few settings
-  // we may need to adjust. Use the settings struct to set
-  // the device's communication mode and addresses:
-  imu.settings.device.commInterface = IMU_MODE_I2C;
-  imu.settings.device.mAddress = LSM9DS1_M;
-  imu.settings.device.agAddress = LSM9DS1_AG;
-  imu.settings.accel.scale = 16; // Set accel range to +/-16g
-  imu.settings.gyro.scale = 2000; // Set gyro range to +/-2000dps
-  imu.settings.mag.scale = 8; // Set mag range to +/-8Gs
-  imu.begin();
-}*/
-
-void initLogFile()
-{
-  if (!SD.exists("log.csv"))
-  {
-    //Write CSV header
-    File dataFile = SD.open("log.csv", FILE_WRITE);
-    if (dataFile) {
-      dataFile.println(CSV_HEADER_LOG);
-      dataFile.close();
-      Serial.println("[LOG] Successfully wrote CSV header to status log");
-    }
-    else {
-      Serial.println("[SD] Error opening status log");
-    }
-  }
-}
-
-void logsd(String tag, String message)
-{
-  Serial.print(" [" + tag + "] " + message);
-  
-  File dataFile = SD.open("log.csv", FILE_WRITE);
-  if (dataFile) {
-    dataFile.print("," + tag + "," + message);
-    dataFile.close();
-  }
-  else {
-    Serial.println("[LOG] Failed to write to status log");
-  }
-}
-
-void logln(String tag, String message)
-{
-  message = message + "\r\n";
-  logsd(tag, message);
-}
-
-void writeCSVHeader()
+static void writeCSVHeader()
 {
   //Write CSV header
   File dataFile = SD.open(logname, FILE_WRITE);
   if (dataFile) {
     dataFile.println(CSV_HEADER_DATA);
     dataFile.close();
-    Serial.println("[LOG] Successfully wrote CSV header to " + String(logid));
+    logln("LOG", "Successfully wrote CSV header to " + String(logid));
   }
   else {
-    Serial.println("[SD] Error opening log with id " + String(logid));
+    logln("SD", "Error opening log with id " + String(logid));
   }
 }
 
-void incrementLogFile()
+static void incrementLogFile()
 {
   logid = logid + 1;
-  logln("LOG", "Incrementing log to " + String(logid));
   filesize = 0;
   
   //Set logging string
@@ -238,53 +175,48 @@ void incrementLogFile()
   
   //s.toCharArray(l, s.length());
   strcpy(logname, lname);
-  logln("LOG", "Incremented log to " + String(logid));
+  logln("LOG", "Incremented log to " + String(logid) + " ", false);
+  Serial.println(logname);
 }
 
-int setupSD()
+static int setupSD()
 {
   if (!SD.begin(chipSelect)) {
-    Serial.println("[SD] Card failed, or not present");
+    logln("SD", "Card failed, or not present");
     return 1;
   }
-
-  initLogFile();
-  Serial.println("[SD] Card initialized");
+  
+  logln("SD", "Card initialized");
   
   while (SD.exists(logname))
   {
-    Serial.println("[LOG] Log already exists!");
+    logln("LOG", "Log already exists!");
     incrementLogFile();
   }
 
   writeCSVHeader();
 
   logln("LOG", "Log ready!");
+
   return 0;
 }
 
 void setup()
 {
   // Open serial communications and wait for port to open:
-  Serial.begin(9600);
-
+  Serial.begin(115200);
+  
   // Init RTC
   Wire.begin();
   rtc.begin();
-  Serial.println("[TIME] Time is now " + getTime());
+  logln("TIME", "Time is now " + getTime());
 
   // Init Logging
   logname = (char*)malloc(16);
   strcpy(logname, "data.csv");
-  
-  Serial.println("[SD] Initializing SD card...");
+
+  logln("SD", "Initializing SD card...");
   setupSD();
-
-  //init IMU
-  //initIMU();
-
-  //init high-accuracy RTC
-  //syncClock();
 }
 
 void loop()
@@ -310,17 +242,22 @@ void loop()
   
   //If available, write
   if (dataFile) {
-    Serial.println(dataString);
     dataFile.println(dataString);
     dataFile.close();
-    delay(200);
+    logln("DATA", dataString);
+    //delay(200);
   }
   //If not available, print error
   else {
-    Serial.println("[SD] Error opening log with id " + String(logid));
+    logln("SD", "Error opening log with id " + String(logid));
     setupSD();
   }
 }
+
+
+
+
+
 
 
 

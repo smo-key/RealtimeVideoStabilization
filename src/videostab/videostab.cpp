@@ -9,7 +9,7 @@ using namespace cv;
 
 // This video stablisation smooths the global trajectory using a sliding average window
 
-const int SMOOTHING_RADIUS = 15; // In frames. The larger the more stable the video, but less reactive to sudden panning
+const int SMOOTHING_RADIUS = 30; // In frames. The larger the more stable the video, but less reactive to sudden panning
 const int HORIZONTAL_BORDER_CROP = 20; // In pixels. Crops the border to reduce the black borders from stabilisation being too noticeable.
 
 									   // 1. Get previous to current frame transformation (dx, dy, da) for all frames
@@ -90,7 +90,7 @@ int main(int argc, char **argv)
 		vector <uchar> status;
 		vector <float> err;
 
-		goodFeaturesToTrack(prev_grey, prev_corner, 200, 0.005, 30, noArray(), 3, true);
+		goodFeaturesToTrack(prev_grey, prev_corner, 200, 0.005, 3);
 		calcOpticalFlowPyrLK(prev_grey, cur_grey, prev_corner, cur_corner, status, err);
 
 		// weed out bad matches
@@ -239,9 +239,9 @@ int main(int argc, char **argv)
 		cur2.copyTo(canvas(Range::all(), Range(cur2.cols + 10, cur2.cols * 2 + 10)));
 
 		// If too big to fit on the screen, then scale it down by 2, hopefully it'll fit :)
-		/*if (canvas.cols > 1920) {
+		if (canvas.cols > 1920) {
 			resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
-		}*/
+		}
 
 		imshow("Before and After", canvas);
 
