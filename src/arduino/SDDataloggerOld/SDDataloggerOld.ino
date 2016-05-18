@@ -61,7 +61,7 @@ long filesize = 0;
 int logid = 0;
 char* logname;
 
-const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB  
+const long long MAX_FILESIZE = 1024ll;// * 1024ll * 50ll; //50MiB  
 const String CSV_HEADER_DATA = "TIME (UTC+0),TIME DELTA,EPOCH,VCC";
 
 unsigned long long offset = 0;
@@ -134,7 +134,11 @@ String getTime()
   uint32_t ts = now.getEpoch(); //get UNIX time
   unsigned long m = millis();
   String dec = String((m) % 1000, DEC);
+  while (dec.length() < 3)
+    dec = "0" + dec;
   String secs = String((m - (m % 1000)) / 1000, DEC);
+  while (secs.length() < 5)
+    secs = "0" + secs;
   String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
              (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
              (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
@@ -201,6 +205,8 @@ static int setupSD()
   return 0;
 }
 
+File dataFile;
+
 void setup()
 {
   // Open serial communications and wait for port to open:
@@ -217,6 +223,9 @@ void setup()
 
   logln("SD", "Initializing SD card...");
   setupSD();
+
+  //Open file - only one allowed at a time
+  dataFile = SD.open(logname, FILE_WRITE);
 }
 
 void loop()
@@ -226,31 +235,40 @@ void loop()
 
   // read three sensors and append to the string:
   dataString += getTime();
-  dataString += "," + String(readVcc());
+  //dataString += "," + String(readVcc());
   //dataString += "," + String(analogRead(0));
 
   // rotate logs if filesize exceeds max size
   filesize = filesize + (long long)(dataString.length() + 2);
   if (filesize >= MAX_FILESIZE)
   {
+    dataFile.close();
     incrementLogFile();
     writeCSVHeader();
-  }
 
-  //Open file - only one allowed at a time
-  File dataFile = SD.open(logname, FILE_WRITE);
+    //Open file - only one allowed at a time
+    dataFile = SD.open(logname, FILE_WRITE);
+  }
   
   //If available, write
   if (dataFile) {
     dataFile.println(dataString);
-    dataFile.close();
     logln("DATA", dataString);
-    //delay(200);
+    if (!SD.exists(logname))
+    {
+      logln("SD", "Possible problem writing to card");
+      dataFile.close();
+      dataFile = SD.open(logname, FILE_WRITE);
+    }
   }
   //If not available, print error
   else {
     logln("SD", "Error opening log with id " + String(logid));
     setupSD();
+    
+    //Open file - only one allowed at a time
+    dataFile = SD.open(logname, FILE_WRITE);
+    //incrementLogFile();
   }
 }
 
