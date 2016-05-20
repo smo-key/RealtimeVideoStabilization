@@ -21,17 +21,24 @@
  */
 
 //SD
+#include <Wire.h>
 #include <SPI.h>
+#include <SparkFunLSM9DS1.h>
 #include <SD.h>
 #include <stdint.h>
 #include <stdlib.h>
 //RTC
-#include <Wire.h>
 #include "Sodaq_DS3231.h"
+
+// Use the LSM9DS1 class to create an object. [imu] can be
+// named anything, we'll refer to that throught the sketch.
+//LSM9DS1 imu;
 
 const int chipSelect = 8;
 
-long readVcc() {
+long lastVcc = 0;
+
+static long readVcc() { 
   // Read 1.1V reference against AVcc
   // set the reference to Vcc and the measurement to the internal 1.1V reference
   #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
@@ -61,8 +68,8 @@ long filesize = 0;
 int logid = 0;
 char* logname;
 
-const long long MAX_FILESIZE = 1024ll;// * 1024ll * 50ll; //50MiB  
-const String CSV_HEADER_DATA = "TIME (UTC+0),TIME DELTA,EPOCH,VCC";
+const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB  
+const String CSV_HEADER_DATA = "TIME (UTC+0),TIME DELTA,EPOCH,COUNT,VCC";
 
 unsigned long long offset = 0;
 
@@ -205,7 +212,39 @@ static int setupSD()
   return 0;
 }
 
-File dataFile;
+// SDO_XM and SDO_G are both pulled high, so our addresses are:
+#define LSM9DS1_M  0x1E // Would be 0x1C if SDO_M is LOW
+#define LSM9DS1_AG  0x6B // Would be 0x6A if SDO_AG is LOW
+// Earth's magnetic field varies by location. Add or subtract 
+// a declination to get a more accurate heading. Calculate 
+// your's here:
+// http://www.ngdc.noaa.gov/geomag-web/#declination
+#define DECLINATION 4 + 2/60 // Declination (degrees) in Austin, Texas
+
+/*static void setupIMU()
+{
+  // Before initializing the IMU, there are a few settings
+  // we may need to adjust. Use the settings struct to set
+  // the device's communication mode and addresses:
+  imu.settings.device.commInterface = IMU_MODE_I2C;
+  imu.settings.device.mAddress = LSM9DS1_M;
+  imu.settings.device.agAddress = LSM9DS1_AG;
+  imu.settings.accel.scale = 16; // Set accel range to +/-16g
+  imu.settings.gyro.scale = 2000; // Set gyro range to +/-2000dps
+  imu.settings.mag.scale = 8; // Set mag range to +/-8Gs
+  // The above lines will only take effect AFTER calling
+  // imu.begin(), which verifies communication with the IMU
+  // and turns it on.
+  logln("IMU", "Starting begin()...");
+  while (!imu.begin())
+  {
+    logln("IMU", "Failed to init IMU.");
+    delay(1000);
+  }
+  logln("IMU", "Init successful!");
+}*/
+
+unsigned long count = 0;
 
 void setup()
 {
@@ -224,8 +263,11 @@ void setup()
   logln("SD", "Initializing SD card...");
   setupSD();
 
-  //Open file - only one allowed at a time
-  dataFile = SD.open(logname, FILE_WRITE);
+  //logln("IMU", "Initializing IMU...");
+  //setupIMU();
+  
+  //Reset loop count
+  count = 1;
 }
 
 void loop()
@@ -235,41 +277,42 @@ void loop()
 
   // read three sensors and append to the string:
   dataString += getTime();
-  //dataString += "," + String(readVcc());
-  //dataString += "," + String(analogRead(0));
+  dataString += "," + String(count,DEC);
+  if (count % 500 == 0)
+  {
+    lastVcc = readVcc();
+  }
+  dataString += "," + String(lastVcc);
 
   // rotate logs if filesize exceeds max size
   filesize = filesize + (long long)(dataString.length() + 2);
   if (filesize >= MAX_FILESIZE)
   {
-    dataFile.close();
     incrementLogFile();
     writeCSVHeader();
-
-    //Open file - only one allowed at a time
-    dataFile = SD.open(logname, FILE_WRITE);
   }
+
+  //Open file - only one allowed at a time
+  File dataFile = SD.open(logname, FILE_WRITE);
   
   //If available, write
   if (dataFile) {
     dataFile.println(dataString);
     logln("DATA", dataString);
+    dataFile.close();
     if (!SD.exists(logname))
     {
       logln("SD", "Possible problem writing to card");
-      dataFile.close();
-      dataFile = SD.open(logname, FILE_WRITE);
     }
   }
   //If not available, print error
   else {
     logln("SD", "Error opening log with id " + String(logid));
     setupSD();
-    
-    //Open file - only one allowed at a time
-    dataFile = SD.open(logname, FILE_WRITE);
     //incrementLogFile();
   }
+
+  count++;
 }
 
 

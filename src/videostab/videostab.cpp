@@ -104,7 +104,7 @@ int main(int argc, char **argv)
 		// translation + rotation only
 		Mat T = estimateRigidTransform(prev_corner2, cur_corner2, false); // false = rigid transform, no scaling/shearing
 
-																		  // in rare cases no transform is found. We'll just use the last known good transform.
+		// in rare cases no transform is found. We'll just use the last known good transform.
 		if (T.data == NULL) {
 			last_T.copyTo(T);
 		}
