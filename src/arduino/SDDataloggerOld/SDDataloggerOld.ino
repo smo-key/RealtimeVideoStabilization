@@ -23,18 +23,15 @@
 //SD
 #include <Wire.h>
 #include <SPI.h>
-#include <SparkFunLSM9DS1.h>
 #include <SD.h>
-#include <stdint.h>
-#include <stdlib.h>
+//#include <stdint.h>
+//#include <stdlib.h>
 //RTC
 #include "Sodaq_DS3231.h"
 
-// Use the LSM9DS1 class to create an object. [imu] can be
-// named anything, we'll refer to that throught the sketch.
-//LSM9DS1 imu;
+LSM9DS1 imu;
 
-const int chipSelect = 8;
+const int chipSelect = 10;
 
 long lastVcc = 0;
 
@@ -69,9 +66,11 @@ int logid = 0;
 char* logname;
 
 const long long MAX_FILESIZE = 1024ll * 1024ll * 50ll; //50MiB  
-const String CSV_HEADER_DATA = "TIME (UTC+0),TIME DELTA,EPOCH,COUNT,VCC";
+const String CSV_HEADER_DATA = "TIME (UTC+0),UPTIME,EPOCH,COUNT,VCC";
 
 unsigned long long offset = 0;
+
+boolean rtcReady = false;
 
 static void logln(String tag, String message, boolean newline=true)
 {
@@ -120,7 +119,14 @@ static void logln(String tag, String message, boolean newline=true)
 
 String getTimeShort()
 {
-  DateTime now = rtc.now(); //get the current date-time
+  DateTime now;
+  boolean rtcSane = rtcReady;
+  //test saneness of RTC
+  if (rtcReady)
+  {
+    now = rtc.now();
+    if (now.hour() > 24 || now.minute() > 60 || now.second() > 60) rtcSane = false;
+  }
   unsigned long m = millis();
   String dec = String((m) % 1000, DEC);
   while (dec.length() < 3)
@@ -128,28 +134,44 @@ String getTimeShort()
   String secs = String((m - (m % 1000)) / 1000, DEC);
   while (secs.length() < 5)
     secs = "0" + secs;
-  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
-             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
-             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) + 
-             " " + secs + "." + dec;
+  String a;
+  if (rtcSane)
+    a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
+         (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
+         (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) + 
+         " " + secs + "." + dec;
+  else
+    a = "00:00:00 " + secs + "." + dec;
   return a;
 }
 
 String getTime()
 {
-  DateTime now = rtc.now(); //get the current date-time
-  uint32_t ts = now.getEpoch(); //get UNIX time
+  DateTime now;
+  uint32_t ts;
+  boolean rtcSane = rtcReady;
+  //test saneness of RTC
+  if (rtcReady)
+  {
+    now = rtc.now();
+    if (now.hour() > 24 || now.minute() > 60 || now.second() > 60) rtcSane = false;
+  }
+  if (rtcSane) ts = now.getEpoch(); //get UNIX time
   unsigned long m = millis();
   String dec = String((m) % 1000, DEC);
   while (dec.length() < 3)
     dec = "0" + dec;
   String secs = String((m - (m % 1000)) / 1000, DEC);
   while (secs.length() < 5)
-    secs = "0" + secs;
-  String a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
-             (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
-             (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
-             "," + secs + "." + dec + "," + String(ts, DEC);
+    secs = "0" + secs;  
+  String a;
+  if (rtcSane)
+    a = (now.hour() < 10 ? String("0") : String("")) + String(now.hour(),DEC) +
+               (now.minute() < 10 ? String(":0") : String(":")) + String(now.minute(),DEC) +
+               (now.second() < 10 ? String(":0") : String(":")) + String(now.second(),DEC) +
+               "," + secs + "." + dec + "," + String(ts, DEC);
+  else
+    a = "00:00:00 " + secs + "." + dec;
   return a;
 }
 
@@ -190,8 +212,8 @@ static void incrementLogFile()
   Serial.println(logname);
 }
 
-static int setupSD()
-{
+int setupSD()
+{  
   if (!SD.begin(chipSelect)) {
     logln("SD", "Card failed, or not present");
     return 1;
@@ -250,21 +272,23 @@ void setup()
 {
   // Open serial communications and wait for port to open:
   Serial.begin(115200);
+
+  rtcReady = false;
+  logln("IMU", "Initializing IMU...");
+  //setupIMU();
   
   // Init RTC
-  Wire.begin();
+  logln("TIME", "Initializing RTC...");
   rtc.begin();
+  rtcReady = true;
   logln("TIME", "Time is now " + getTime());
 
   // Init Logging
   logname = (char*)malloc(16);
   strcpy(logname, "data.csv");
-
+  
   logln("SD", "Initializing SD card...");
   setupSD();
-
-  //logln("IMU", "Initializing IMU...");
-  //setupIMU();
   
   //Reset loop count
   count = 1;

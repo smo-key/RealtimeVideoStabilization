@@ -32,15 +32,15 @@ SdFile root;
 // Arduino Ethernet shield: pin 4
 // Adafruit SD shields and modules: pin 10
 // Sparkfun SD shield: pin 8
-const int chipSelect = 8;
+const int chipSelect = 10;
 
 void setup()
 {
   // Open serial communications and wait for port to open:
-  Serial.begin(9600);
-  while (!Serial) {
+  Serial.begin(115200);
+  /*while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
-  }
+  }*/
 
 
   Serial.print("\nInitializing SD card...");

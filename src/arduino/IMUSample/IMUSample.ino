@@ -1,6 +1,14 @@
 //The 10 Dof sample sketch for reading the BMP085 and IMUs raw data
 
 #include <Wire.h>
+
+#define DEBUG
+#ifdef DEBUG
+#include "DebugUtils.h"
+#endif
+
+#include "CommunicationUtils.h"
+
 #include <FreeSixIMU.h>
 #include <FIMU_ADXL345.h>
 #include <FIMU_ITG3200.h>
@@ -8,6 +16,8 @@
 #include <BMP085.h>
 
 float angles[3]; // yaw pitch roll
+float q[4]; // quaternion
+int values[6]; //raw values
 float heading;
 BMP085 dps = BMP085();
 long Temperature = 0, Pressure = 0, Altitude = 0;
@@ -37,15 +47,14 @@ void setup(){
   error = compass.SetMeasurementMode(Measurement_Continuous); // Set the measurement mode to Continuous  
   if(error != 0) // If there is an error, print it out.
     Serial.println(compass.GetErrorText(error));
-
 }
 
 void loop(){
   dps.getTemperature(&Temperature);
   dps.getPressure(&Pressure);
   dps.getAltitude(&Altitude);
-  
-  sixDOF.getEuler(angles);
+
+  sixDOF.getYawPitchRoll(angles);
 
   getHeading();
   PrintData();
@@ -81,7 +90,7 @@ void getHeading(){
 }
 
 void PrintData(){  
-  /*Serial.print("Eular Angle: ");
+  Serial.print("Eular Angle: ");
   Serial.print(angles[0]);
   Serial.print("  ");  
   Serial.print(angles[1]);
@@ -101,5 +110,5 @@ void PrintData(){
   Serial.print("  ");
   Serial.print("Pressure: ");
   Serial.print(Pressure);
-  Serial.println(" Pa");*/
+  Serial.println(" Pa");
 }
