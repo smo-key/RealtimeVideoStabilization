@@ -43,9 +43,9 @@ static long readVcc() {
 int logid = 0;
 char* logname;
 
-const long MAX_FILESIZE = 1024l;// * 1024l; //1MiB
-#define CSV_HEADER_DATA "UPTIME,COUNT,VCC,YAW,PITCH,ROLL"
-#define PRINT_DEBUG
+//const long MAX_FILESIZE = 1024l;// * 1024l; //1MiB
+#define CSV_HEADER_DATA "UPTIME,COUNT,VCC,GX,GY,GZ,AX,AY,AZ,MX,MY,MZ"
+//#define PRINT_DEBUG
 
 static void logln(String tag, String message)
 {
