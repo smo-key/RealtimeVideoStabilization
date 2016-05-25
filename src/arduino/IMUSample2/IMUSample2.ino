@@ -73,8 +73,8 @@ LSM9DS1 imu;
 ////////////////////////////
 // Sketch Output Settings //
 ////////////////////////////
-#define PRINT_CALCULATED
-//#define PRINT_RAW
+//#define PRINT_CALCULATED
+#define PRINT_RAW
 #define PRINT_SPEED 50 // 250 ms between prints
 
 // Earth's magnetic field varies by location. Add or subtract 
@@ -140,10 +140,21 @@ void setup()
     while (1)
       ;
   }
+
+  imu.calibrate(false);
+  Serial.println(imu.gBiasRaw[0]);
+  Serial.println(imu.gBiasRaw[1]);
+  Serial.println(imu.gBiasRaw[2]);
+  Serial.println(imu.aBiasRaw[0]);
+  Serial.println(imu.aBiasRaw[1]);
+  Serial.println(imu.aBiasRaw[2]);
 }
 
 void loop()
 {
+  //imu.readGyro();
+  //imu.readAccel();
+  //imu.readMag();
   printGyro();  // Print "G: gx, gy, gz"
   printAccel(); // Print "A: ax, ay, az"
   printMag();   // Print "M: mx, my, mz"
@@ -152,7 +163,8 @@ void loop()
   // Call print attitude. The LSM9DS1's magnetometer x and y
   // axes are opposite to the accelerometer, so my and mx are
   // substituted for each other.
-  printAttitude(imu.ax, imu.ay, imu.az, -imu.my, -imu.mx, imu.mz);
+  //printAttitude(imu.ax, imu.ay, imu.az, -imu.my, -imu.mx, imu.mz);
+  printAttitude(imu.az, imu.ay, -imu.ax, -imu.mz, -imu.mx, -imu.my);
   Serial.println();
   
   delay(PRINT_SPEED);

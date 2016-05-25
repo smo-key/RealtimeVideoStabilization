@@ -31,7 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 FreeSixIMU::FreeSixIMU() {
 	acc = ADXL345();
 	gyro = ITG3200();
-	//magn = HMC58X3();
+	///magn = HMC58X3();
 	
   // initialize quaternion
   q0 = 1.0f;
@@ -94,8 +94,7 @@ void FreeSixIMU::init(int acc_addr, int gyro_addr, bool fastmode) {
   // Single mode conversion was used in calibration, now set continuous mode
   //magn.setMode(0);
   //delay(10);
-  //magn.setDOR(B110);
-  
+  //magn.setDOR(B110);  
 }
 
 
@@ -114,7 +113,7 @@ void FreeSixIMU::getValues(float * values) {
   values[1] = ((float) accval[1]);
   values[2] = ((float) accval[2]);
   
-  gyro.readGyro(&values[3]);
+  gyro.readGyro(&values[3], &values[4], &values[5]);
   
   //magn.getValues(&values[6]);
 }

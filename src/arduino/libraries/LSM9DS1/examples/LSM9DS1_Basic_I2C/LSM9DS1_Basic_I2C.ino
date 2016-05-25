@@ -81,7 +81,7 @@ LSM9DS1 imu;
 // a declination to get a more accurate heading. Calculate 
 // your's here:
 // http://www.ngdc.noaa.gov/geomag-web/#declination
-#define DECLINATION -8.58 // Declination (degrees) in Boulder, CO.
+#define DECLINATION 4 + 2/60 // Declination (degrees) in Austin, Texas
 
 void setup() 
 {
