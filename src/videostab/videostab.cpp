@@ -48,8 +48,8 @@ struct Trajectory
 
 int main(int argc, char **argv)
 {
-	if (argc < 2) {
-		cout << "./VideoStab [video.avi]" << endl;
+	if (argc < 3) {
+		cout << "./VideoStab [input.mp4] [output.mp4]" << endl;
 		return 0;
 	}
 
@@ -59,8 +59,17 @@ int main(int argc, char **argv)
 	ofstream out_smoothed_trajectory("smoothed_trajectory.txt");
 	ofstream out_new_transform("new_prev_to_cur_transformation.txt");
 
+	// Setup input video
 	VideoCapture cap(argv[1]);
 	assert(cap.isOpened());
+
+	// Setup output video
+	cv::VideoWriter output(argv[2],
+		cap.get(CV_CAP_PROP_FOURCC),
+		cap.get(CV_CAP_PROP_FPS),
+		cv::Size(cap.get(CV_CAP_PROP_FRAME_WIDTH),
+			cap.get(CV_CAP_PROP_FRAME_HEIGHT)));
+	assert(output.isOpened());
 
 	Mat cur, cur_grey;
 	Mat prev, prev_grey;
@@ -90,7 +99,7 @@ int main(int argc, char **argv)
 		vector <uchar> status;
 		vector <float> err;
 
-		goodFeaturesToTrack(prev_grey, prev_corner, 200, 0.005, 3);
+		goodFeaturesToTrack(prev_grey, prev_corner, 500, 0.0005, 3);
 		calcOpticalFlowPyrLK(prev_grey, cur_grey, prev_corner, cur_corner, status, err);
 
 		// weed out bad matches
@@ -233,26 +242,39 @@ int main(int argc, char **argv)
 		resize(cur2, cur2, cur.size());
 
 		// Now draw the original and stablised side by side for coolness
-		Mat canvas = Mat::zeros(cur.rows, cur.cols * 2 + 10, cur.type());
+		/*Mat canvas = Mat::zeros(cur.rows, cur.cols * 2 + 10, cur.type());
 
 		cur.copyTo(canvas(Range::all(), Range(0, cur2.cols)));
 		cur2.copyTo(canvas(Range::all(), Range(cur2.cols + 10, cur2.cols * 2 + 10)));
 
 		// If too big to fit on the screen, then scale it down by 2, hopefully it'll fit :)
-		if (canvas.cols > 1920) {
-			resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
-		}
+		while (canvas.cols > 1920) {
+			resize(canvas, canvas, Size(canvas.cols / 1.5, canvas.rows / 1.5));
+		}*/
 
-		imshow("Before and After", canvas);
+		cout << "Writing frame " << (k + 1) << "..." << endl;
 
-		//char str[256];
-		//sprintf(str, "images/%08d.jpg", k);
-		//imwrite(str, canvas);
+		//Write a frame to the output video
+		output.write(cur2);
 
-		waitKey(20);
+		//imshow("Before and After", canvas);
+
+		//waitKey(1000/120);
 
 		k++;
 	}
+
+	//waitKey(20);
+	//output.release();
+	//cap.release();
+
+	//imshow("Before and After", canvas);
+
+	/*char str[256];
+	sprintf(str, "images/%08d.jpg", k);
+	imwrite(str, canvas);*/
+
+	//waitKey(20);
 
 	return 0;
 }
