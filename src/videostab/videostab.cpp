@@ -1,3 +1,7 @@
+/*
+ Original source by Nghia Ho (http://nghiaho.com) with improvements by Arthur Pachachura
+*/
+
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <cassert>
@@ -7,16 +11,15 @@
 using namespace std;
 using namespace cv;
 
-// This video stablisation smooths the global trajectory using a sliding average window
-
+//This method smooths the global trajectory using a sliding average window
 const int SMOOTHING_RADIUS = 30; // In frames. The larger the more stable the video, but less reactive to sudden panning
 const int HORIZONTAL_BORDER_CROP = 20; // In pixels. Crops the border to reduce the black borders from stabilisation being too noticeable.
 
-									   // 1. Get previous to current frame transformation (dx, dy, da) for all frames
-									   // 2. Accumulate the transformations to get the image trajectory
-									   // 3. Smooth out the trajectory using an averaging window
-									   // 4. Generate new set of previous to current transform, such that the trajectory ends up being the same as the smoothed trajectory
-									   // 5. Apply the new transformation to the video
+//1. Get previous to current frame transformation (dx, dy, da) for all frames
+//2. Accumulate the transformations to get the image trajectory
+//3. Smooth out the trajectory using an averaging window
+//4. Generate new set of previous to current transform, such that the trajectory ends up being the same as the smoothed trajectory
+//5. Apply the new transformation to the video
 
 struct TransformParam
 {
@@ -234,47 +237,21 @@ int main(int argc, char **argv)
 
 		Mat cur2;
 
+		//Affine transformation
 		warpAffine(cur, cur2, T, cur.size());
 
 		cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(HORIZONTAL_BORDER_CROP, cur2.cols - HORIZONTAL_BORDER_CROP));
 
-		// Resize cur2 back to cur size, for better side by side comparison
+		//Resize back to original
 		resize(cur2, cur2, cur.size());
-
-		// Now draw the original and stablised side by side for coolness
-		/*Mat canvas = Mat::zeros(cur.rows, cur.cols * 2 + 10, cur.type());
-
-		cur.copyTo(canvas(Range::all(), Range(0, cur2.cols)));
-		cur2.copyTo(canvas(Range::all(), Range(cur2.cols + 10, cur2.cols * 2 + 10)));
-
-		// If too big to fit on the screen, then scale it down by 2, hopefully it'll fit :)
-		while (canvas.cols > 1920) {
-			resize(canvas, canvas, Size(canvas.cols / 1.5, canvas.rows / 1.5));
-		}*/
 
 		cout << "Writing frame " << (k + 1) << "..." << endl;
 
 		//Write a frame to the output video
 		output.write(cur2);
 
-		//imshow("Before and After", canvas);
-
-		//waitKey(1000/120);
-
 		k++;
 	}
-
-	//waitKey(20);
-	//output.release();
-	//cap.release();
-
-	//imshow("Before and After", canvas);
-
-	/*char str[256];
-	sprintf(str, "images/%08d.jpg", k);
-	imwrite(str, canvas);*/
-
-	//waitKey(20);
 
 	return 0;
 }

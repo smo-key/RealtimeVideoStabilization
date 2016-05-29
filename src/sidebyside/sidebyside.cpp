@@ -1,3 +1,8 @@
+/*
+ Copyright (C) 2016 Arthur Pachachura
+ MIT licensed. Share and reuse!
+*/
+
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <cassert>
@@ -6,10 +11,6 @@
 
 using namespace std;
 using namespace cv;
-
-// This video stablisation smooths the global trajectory using a sliding average window
-
-const int HORIZONTAL_BORDER_CROP = 20; // In pixels. Crops the border to reduce the black borders from stabilisation being too noticeable.
 
 int main(int argc, char **argv)
 {
@@ -21,7 +22,7 @@ int main(int argc, char **argv)
 	// Setup input video
 	VideoCapture before(argv[1]);
 	assert(before.isOpened());
-	
+
 	VideoCapture after(argv[2]);
 	assert(after.isOpened());
 
@@ -57,7 +58,7 @@ int main(int argc, char **argv)
 
 		imshow("Before and After", canvas);
 
-		waitKey(1000/120);
+		waitKey(1000 / 120);
 
 		k++;
 	}

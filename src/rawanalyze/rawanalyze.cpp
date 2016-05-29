@@ -1,3 +1,8 @@
+/*
+ Copyright (C) 2016 Arthur Pachachura
+ MIT licensed. Share and reuse!
+*/
+
 #define _USE_MATH_DEFINES // for C++
 
 #include <cmath>
@@ -94,8 +99,6 @@ bool dataTest(char** data)
 {
 	if (data == NULL) return false;
 	if (data[0] == NULL) return false;
-	//if (sizeof(data) / sizeof(data[0]) < 12) return false;
-
 	return true;
 }
 
@@ -109,23 +112,6 @@ bool fileExists(const std::string& filename)
 	return false;
 }
 
-float invsqrt(float number)
-{
-	long i;
-	float x2, y;
-	const float threehalfs = 1.5F;
-
-	x2 = number * 0.5F;
-	y = number;
-	i = *(long *)&y;                       // evil floating point bit level hacking
-	i = 0x5f3759df - (i >> 1);               // what the fuck? 
-	y = *(float *)&i;
-	y = y * (threehalfs - (x2 * y * y));   // 1st iteration
-	//y = y * (threehalfs - ( x2 * y * y ) );   // 2nd iteration, this can be removed
-
-	return y;
-}
-
 #define SCALE_GYRO 2000
 #define SCALE_MAG_SENSITIVITY 0.00029f
 #define SCALE_ACCEL 16
@@ -136,7 +122,7 @@ ProcessedData computeYPR(RawData partial)
 	RawData raw(partial);
 
 	//Perform transformation
-	//(az,ay,-ax,-mz,-mx,my)
+	//(az,ay,-ax,-mz,-mx,-my)
 	float tmp[6] = { partial.ax, partial.ay, partial.az, partial.mx, partial.my, partial.mz };
 	partial.ax = tmp[2];
 	partial.ay = tmp[1];
@@ -144,7 +130,7 @@ ProcessedData computeYPR(RawData partial)
 	partial.mx = -tmp[5];
 	partial.my = -tmp[3];
 	partial.mz = -tmp[4];
-	
+
 	//Compute roll and pitch
 	float roll = atan2(partial.ay, partial.az);
 	float pitch = atan2(-partial.ax, sqrt(partial.ay * partial.ay + partial.az * partial.az));
