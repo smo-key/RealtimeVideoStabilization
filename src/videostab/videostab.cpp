@@ -1,257 +1,315 @@
-/*
- Original source by Nghia Ho (http://nghiaho.com) with improvements by Arthur Pachachura
-*/
-
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <cassert>
 #include <cmath>
 #include <fstream>
+#include <mutex>
+#include <chrono>
+#include <thread>
 
 using namespace std;
 using namespace cv;
 
-//This method smooths the global trajectory using a sliding average window
-const int SMOOTHING_RADIUS = 30; // In frames. The larger the more stable the video, but less reactive to sudden panning
-const int HORIZONTAL_BORDER_CROP = 20; // In pixels. Crops the border to reduce the black borders from stabilisation being too noticeable.
+const unsigned int THREADS = 8;
+const unsigned int SMOOTHING_RADIUS = 60;
+#define USE_GPU
 
-//1. Get previous to current frame transformation (dx, dy, da) for all frames
-//2. Accumulate the transformations to get the image trajectory
-//3. Smooth out the trajectory using an averaging window
-//4. Generate new set of previous to current transform, such that the trajectory ends up being the same as the smoothed trajectory
-//5. Apply the new transformation to the video
-
-struct TransformParam
+struct RigidTransform
 {
-	TransformParam() {}
-	TransformParam(double _dx, double _dy, double _da) {
-		dx = _dx;
-		dy = _dy;
-		da = _da;
+public:
+	double x, y;	//position
+	double angle;	//rotation
+
+	RigidTransform()
+	{
+		x = 0.0;
+		y = 0.0;
+		angle = 0.0;
+	}
+	RigidTransform(double x, double y, double angle)
+	{
+		this->x = x;
+		this->y = y;
+		this->angle = angle;
+	}
+	RigidTransform& operator+=(const RigidTransform &other) {
+		this->x += other.x;
+		this->y += other.y;
+		this->angle += other.angle;
+		return *this;
+	}
+	RigidTransform& operator/=(const int &other) {
+		this->x /= other;
+		this->y /= other;
+		this->angle /= other;
+		return *this;
 	}
 
-	double dx;
-	double dy;
-	double da; // angle
+	Mat makeMatrix()
+	{
+		//Particularly, an affine transformation matrix
+		Mat T(2, 3, CV_64F);
+
+		T.at<double>(0, 0) = cos(angle);
+		T.at<double>(0, 1) = -sin(angle);
+		T.at<double>(1, 0) = sin(angle);
+		T.at<double>(1, 1) = cos(angle);
+
+		T.at<double>(0, 2) = x;
+		T.at<double>(1, 2) = y;
+
+		return T;
+	}
 };
 
-struct Trajectory
+//Video I/O
+VideoCapture input;
+VideoWriter output;
+mutex outputLock;
+mutex coutLock;
+
+UMat frames[THREADS];
+UMat framesGray[THREADS];
+Mat framesOut[THREADS];
+bool threadBusy[THREADS];
+bool threadWriteLock[THREADS]; //Write locks
+
+const unsigned int FRAMES = max(THREADS + 1, SMOOTHING_RADIUS);
+RigidTransform framesT[FRAMES];
+RigidTransform framesTTemp[THREADS];
+RigidTransform frameZero = RigidTransform();
+
+void calculateDt(const unsigned int i, const unsigned int threadId, bool storeFinal=true)
 {
-	Trajectory() {}
-	Trajectory(double _x, double _y, double _a) {
-		x = _x;
-		y = _y;
-		a = _a;
+	if (!storeFinal)
+	{
+		coutLock.lock();
+		cout << "Precalculating frame " << i << " (thread " << threadId << ")" << endl;
+		coutLock.unlock();
 	}
 
-	double x;
-	double y;
-	double a; // angle
-};
+	//Loop around when we are at the end of the array
+	const unsigned int idCur = i % FRAMES;
+	const unsigned int idPrev = i - 1 % FRAMES;
 
-int main(int argc, char **argv)
-{
-	if (argc < 3) {
-		cout << "./VideoStab [input.mp4] [output.mp4]" << endl;
-		return 0;
+	//Store into temp matrices
+	UMat matCur = frames[threadId % THREADS];
+	UMat matPrev = frames[threadId - 1 % THREADS];
+	UMat greyCur = framesGray[threadId % THREADS];
+	UMat greyPrev = framesGray[threadId - 1 % THREADS];
+
+	//Lock necessary variables
+	//framesLock[idCur].lock();
+	//framesLock[idPrev].lock();
+
+	//Keypoint vectors and status vectors
+	vector <Point2f> _keypointPrev, _keypointCur, keypointPrev, keypointCur;
+	vector <uchar> status;
+	vector <float> err;
+
+	//Find good features
+	goodFeaturesToTrack(greyPrev, _keypointPrev, 500, 0.0005, 3);
+
+	//Calculate optical flow
+	calcOpticalFlowPyrLK(greyPrev, greyCur, _keypointPrev, _keypointCur, status, err);
+
+	//Remove bad matches
+	for (size_t i = 0; i < status.size(); i++)
+	{
+		if (status[i])
+		{
+			keypointPrev.push_back(_keypointPrev[i]);
+			keypointCur.push_back(_keypointCur[i]);
+		}
 	}
 
-	// For further analysis
-	ofstream out_transform("prev_to_cur_transformation.txt");
-	ofstream out_trajectory("trajectory.txt");
-	ofstream out_smoothed_trajectory("smoothed_trajectory.txt");
-	ofstream out_new_transform("new_prev_to_cur_transformation.txt");
+	//Estimate transformation with translation and rotation only
+	Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false); //false = rigid
 
-	// Setup input video
-	VideoCapture cap(argv[1]);
-	assert(cap.isOpened());
+	//Decompose transformation matrix
+	double dx = matT.at<double>(0, 2);
+	double dy = matT.at<double>(1, 2);
+	double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
+	RigidTransform dT(dx, dy, da);
 
-	// Setup output video
-	cv::VideoWriter output(argv[2],
-		cap.get(CV_CAP_PROP_FOURCC),
-		cap.get(CV_CAP_PROP_FPS),
-		cv::Size(cap.get(CV_CAP_PROP_FRAME_WIDTH),
-			cap.get(CV_CAP_PROP_FRAME_HEIGHT)));
+	//Store variables now (used when preprocessing frames)
+	if (storeFinal)
+		framesT[idCur] = dT;		//Write current transform to final array
+	else
+		framesTTemp[threadId] = dT; //Write current transform to temp array
+}
+
+void analyzeFrame(const unsigned int i, const unsigned int threadId)
+{
+	coutLock.lock();
+	cout << "Analyzing frame " << i << " (thread " << threadId << ")" << endl;
+	coutLock.unlock();
+
+	//Loop around when we are at the end of the array
+	const unsigned int idCur = i % FRAMES;
+	const unsigned int idPrev = i - 1 % FRAMES;
+
+	//Store into temp matrices
+	UMat* matCur = &frames[threadId % THREADS];
+	UMat* matPrev = &frames[threadId - 1 % THREADS];
+	UMat* greyCur = &framesGray[threadId % THREADS];
+	UMat* greyPrev = &framesGray[threadId - 1 % THREADS];
+
+	//Calculate transform difference for the frame
+	calculateDt(i, threadId);
+	RigidTransform dT = framesT[i];
+
+	//Smooth transformation using an averaging window
+	RigidTransform T(frameZero);
+	//Skip the current frame (we didn't put it into our vector yet)
+	for (size_t i = idCur + 1; i < FRAMES + idCur; i++)
+	{
+		T += framesT[i % FRAMES];
+	}
+	//Now add in the current frame
+	T += dT;
+	//Divide by current frame count to get smoothed value
+	T /= FRAMES;
+
+	//Create target transformation matrix
+	Mat frameTransform = T.makeMatrix();
+
+	//Get output image using affine transformation
+	Mat out;
+	warpAffine(*matCur, out, frameTransform, matCur->size());
+
+	//Wait for the frame occupying the thread has been written
+	while (threadWriteLock[threadId])
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+	//Write values for other frames to use
+	framesT[idCur] = dT;		//Write current transform
+	framesOut[threadId] = out;	//Write output frame
+	threadWriteLock[threadId] = true;
+
+	//Done with frame
+	threadBusy[threadId] = false;
+}
+
+void startThreads()
+{
+	//Get and set frame info
+	input.set(CV_CAP_PROP_POS_FRAMES, 0); //reset frame position
+	const unsigned int maxFrame = input.get(CV_CAP_PROP_FRAME_COUNT);
+
+	//Preprocess first first few frames for transform matrix
+	thread threads[THREADS];
+	unsigned int threadId = 0;
+	for (size_t frame = 1; frame < min(FRAMES, maxFrame) - 1; frame++)
+	{
+		//Get the frame
+		input >> frames[frame];
+		cvtColor(frames[frame], framesGray[frame], COLOR_BGR2GRAY);
+
+		//Spawn transform calculation thread
+		threads[frame] = thread(calculateDt, frame, (frame - 1) % THREADS, false);
+	}
+	//Wait for threads to finish
+	for (size_t i = 0; i < THREADS; i++)
+	{
+		threads[i].join();
+		threadBusy[i] = true; //set this flag for later
+		threadWriteLock[i] = false;
+	}
+
+	//Start main threading
+	input.set(CV_CAP_PROP_POS_FRAMES, 0);
+	unsigned int frame = 1; //next frame to process
+
+	//Start first few threads
+	for (frame = 1; frame < min(THREADS, maxFrame - 1); frame++)
+	{
+		//Spawn transform calculation thread
+		threads[frame-1] = thread(analyzeFrame, frame, (frame - 1) % THREADS);
+	}
+	frame = 1 + THREADS;
+	
+	//Run all threads, checking for completion
+	unsigned int frameWrite = 1; //next frame to write
+	unsigned int threadFrameIndex[THREADS];
+	while (frame < maxFrame)
+	{
+		for (int t = 0; t < THREADS; t++)
+		{
+			if (!threadBusy[t])
+			{
+				//While we have the next frame to write, do it
+				for (int tWrite = 0; tWrite < THREADS; tWrite++)
+				{
+					if (threadFrameIndex[tWrite] == frameWrite)
+					{
+						coutLock.lock();
+						cout << "Writing frame " << frameWrite << " (thread " << tWrite << ")" << endl;
+						coutLock.unlock();
+						output.write(framesOut[tWrite]);
+						threadWriteLock[tWrite] = false;
+						frameWrite++;
+					}
+				}
+
+				//Launch new frame, if another exists
+				if (frame < maxFrame)
+				{
+					//Read new frame
+					input >> frames[frame];
+					cvtColor(frames[frame], framesGray[frame], COLOR_BGR2GRAY);
+
+					threadFrameIndex[t] = frame;
+					threadBusy[t] = true;
+					threads[t] = thread(analyzeFrame, frame, t);
+					frame++;
+				}
+			}
+		}
+		//Sleep a bit before checking again
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	
+	//Wait for all threads to end
+	for (size_t i = 0; i < THREADS; i++)
+	{
+		threads[i].join();
+	}
+}
+
+int main(int argc, char** argv)
+{
+	if (argc < 3)
+	{
+		cout << "./videostab (options) (data.csv) [input.mp4] [output.mp4]" << endl;
+		cout << endl;
+		cout << "TRANSFORM OPTIONS" << endl;
+		cout << "-S (-prsh)  Similarity Transform (Position, Rotation, Scale, sHear)" << endl;
+		cout << endl;
+		cout << "RENDERING OPTIONS" << endl;
+		cout << "-G          Use GPU (default=no)" << endl;
+		cout << "-Tn         Use n threads (default=4)" << endl;
+	}
+
+	//Prepare input video
+	input = VideoCapture(argv[1]);
+	assert(input.isOpened());
+
+	//Prepare output video
+	output = VideoWriter(argv[2],
+		input.get(CV_CAP_PROP_FOURCC),
+		input.get(CV_CAP_PROP_FPS),
+		Size(input.get(CV_CAP_PROP_FRAME_WIDTH),
+			input.get(CV_CAP_PROP_FRAME_HEIGHT)));
 	assert(output.isOpened());
 
-	Mat cur, cur_grey;
-	Mat prev, prev_grey;
+	//Prepare analysis variables
+	input >> frames[0];
+	framesT[0] = RigidTransform();
 
-	cap >> prev;
-	cvtColor(prev, prev_grey, COLOR_BGR2GRAY);
+	//Start threads
+	startThreads();
 
-	// Step 1 - Get previous to current frame transformation (dx, dy, da) for all frames
-	vector <TransformParam> prev_to_cur_transform; // previous to current
-
-	int k = 1;
-	int max_frames = cap.get(CV_CAP_PROP_FRAME_COUNT);
-	Mat last_T;
-
-	while (true) {
-		cap >> cur;
-
-		if (cur.data == NULL) {
-			break;
-		}
-
-		cvtColor(cur, cur_grey, COLOR_BGR2GRAY);
-
-		// vector from prev to cur
-		vector <Point2f> prev_corner, cur_corner;
-		vector <Point2f> prev_corner2, cur_corner2;
-		vector <uchar> status;
-		vector <float> err;
-
-		goodFeaturesToTrack(prev_grey, prev_corner, 500, 0.0005, 3);
-		calcOpticalFlowPyrLK(prev_grey, cur_grey, prev_corner, cur_corner, status, err);
-
-		// weed out bad matches
-		for (size_t i = 0; i < status.size(); i++) {
-			if (status[i]) {
-				prev_corner2.push_back(prev_corner[i]);
-				cur_corner2.push_back(cur_corner[i]);
-			}
-		}
-
-		// translation + rotation only
-		Mat T = estimateRigidTransform(prev_corner2, cur_corner2, false); // false = rigid transform, no scaling/shearing
-
-		// in rare cases no transform is found. We'll just use the last known good transform.
-		if (T.data == NULL) {
-			last_T.copyTo(T);
-		}
-
-		T.copyTo(last_T);
-
-		// decompose T
-		double dx = T.at<double>(0, 2);
-		double dy = T.at<double>(1, 2);
-		double da = atan2(T.at<double>(1, 0), T.at<double>(0, 0));
-
-		prev_to_cur_transform.push_back(TransformParam(dx, dy, da));
-
-		out_transform << k << " " << dx << " " << dy << " " << da << endl;
-
-		cur.copyTo(prev);
-		cur_grey.copyTo(prev_grey);
-
-		cout << "Frame: " << k << "/" << max_frames << " - features: " << prev_corner2.size() << endl;
-		k++;
-	}
-
-	// Step 2 - Accumulate the transformations to get the image trajectory
-
-	// Accumulated frame to frame transform
-	double a = 0;
-	double x = 0;
-	double y = 0;
-
-	vector <Trajectory> trajectory; // trajectory at all frames
-
-	for (size_t i = 0; i < prev_to_cur_transform.size(); i++) {
-		x += prev_to_cur_transform[i].dx;
-		y += prev_to_cur_transform[i].dy;
-		a += prev_to_cur_transform[i].da;
-
-		trajectory.push_back(Trajectory(x, y, a));
-
-		out_trajectory << (i + 1) << " " << x << " " << y << " " << a << endl;
-	}
-
-	// Step 3 - Smooth out the trajectory using an averaging window
-	vector <Trajectory> smoothed_trajectory; // trajectory at all frames
-
-	for (size_t i = 0; i < trajectory.size(); i++) {
-		double sum_x = 0;
-		double sum_y = 0;
-		double sum_a = 0;
-		int count = 0;
-
-		for (int j = -SMOOTHING_RADIUS; j <= SMOOTHING_RADIUS; j++) {
-			if (i + j >= 0 && i + j < trajectory.size()) {
-				sum_x += trajectory[i + j].x;
-				sum_y += trajectory[i + j].y;
-				sum_a += trajectory[i + j].a;
-
-				count++;
-			}
-		}
-
-		double avg_a = sum_a / count;
-		double avg_x = sum_x / count;
-		double avg_y = sum_y / count;
-
-		smoothed_trajectory.push_back(Trajectory(avg_x, avg_y, avg_a));
-
-		out_smoothed_trajectory << (i + 1) << " " << avg_x << " " << avg_y << " " << avg_a << endl;
-	}
-
-	// Step 4 - Generate new set of previous to current transform, such that the trajectory ends up being the same as the smoothed trajectory
-	vector <TransformParam> new_prev_to_cur_transform;
-
-	// Accumulated frame to frame transform
-	a = 0;
-	x = 0;
-	y = 0;
-
-	for (size_t i = 0; i < prev_to_cur_transform.size(); i++) {
-		x += prev_to_cur_transform[i].dx;
-		y += prev_to_cur_transform[i].dy;
-		a += prev_to_cur_transform[i].da;
-
-		// target - current
-		double diff_x = smoothed_trajectory[i].x - x;
-		double diff_y = smoothed_trajectory[i].y - y;
-		double diff_a = smoothed_trajectory[i].a - a;
-
-		double dx = prev_to_cur_transform[i].dx + diff_x;
-		double dy = prev_to_cur_transform[i].dy + diff_y;
-		double da = prev_to_cur_transform[i].da + diff_a;
-
-		new_prev_to_cur_transform.push_back(TransformParam(dx, dy, da));
-
-		out_new_transform << (i + 1) << " " << dx << " " << dy << " " << da << endl;
-	}
-
-	// Step 5 - Apply the new transformation to the video
-	cap.set(CV_CAP_PROP_POS_FRAMES, 0);
-	Mat T(2, 3, CV_64F);
-
-	int vert_border = HORIZONTAL_BORDER_CROP * prev.rows / prev.cols; // get the aspect ratio correct
-
-	k = 0;
-	while (k < max_frames - 1) { // don't process the very last frame, no valid transform
-		cap >> cur;
-
-		if (cur.data == NULL) {
-			break;
-		}
-
-		T.at<double>(0, 0) = cos(new_prev_to_cur_transform[k].da);
-		T.at<double>(0, 1) = -sin(new_prev_to_cur_transform[k].da);
-		T.at<double>(1, 0) = sin(new_prev_to_cur_transform[k].da);
-		T.at<double>(1, 1) = cos(new_prev_to_cur_transform[k].da);
-
-		T.at<double>(0, 2) = new_prev_to_cur_transform[k].dx;
-		T.at<double>(1, 2) = new_prev_to_cur_transform[k].dy;
-
-		Mat cur2;
-
-		//Affine transformation
-		warpAffine(cur, cur2, T, cur.size());
-
-		cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(HORIZONTAL_BORDER_CROP, cur2.cols - HORIZONTAL_BORDER_CROP));
-
-		//Resize back to original
-		resize(cur2, cur2, cur.size());
-
-		cout << "Writing frame " << (k + 1) << "..." << endl;
-
-		//Write a frame to the output video
-		output.write(cur2);
-
-		k++;
-	}
-
+	//Exit
 	return 0;
 }
