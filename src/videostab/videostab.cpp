@@ -12,7 +12,7 @@ using namespace std;
 using namespace cv;
 
 const unsigned int THREADS = 8;
-const unsigned int SMOOTHING_RADIUS = 20;
+const unsigned int SMOOTHING_RADIUS = 5;
 #define USE_GPU
 
 struct RigidTransform
@@ -73,7 +73,7 @@ Mat framesOut[THREADS];
 bool threadBusy[THREADS];
 bool threadWriteLock[THREADS]; //Write locks
 
-const unsigned int FRAMES = max(THREADS, SMOOTHING_RADIUS);
+const unsigned int FRAMES = max(THREADS, SMOOTHING_RADIUS*2);
 Mat frames[FRAMES];
 Mat framesGray[FRAMES];
 RigidTransform framesT[FRAMES];
@@ -280,9 +280,12 @@ void startThreads()
 	//Start main threading
 	input.set(CV_CAP_PROP_POS_FRAMES, 0);
 
-	//Ignore first frame
-	input >> frames[0];
-	cvtColor(frames[0], framesGray[0], COLOR_BGR2GRAY);
+	//Read in first radius of frames
+	for (int f = 0; f < FRAMES / 2; f++)
+	{
+		input >> frames[f];
+		cvtColor(frames[f], framesGray[f], COLOR_BGR2GRAY);
+	}
 
 	frame = 1;
 	
@@ -305,17 +308,22 @@ void startThreads()
 
 			if (!threadBusy[t] && !threadWriteLock[t])
 			{
-				//Launch new frame, if another exists
+				//Process new frame, if another exists
+				int framePos = (frame + (FRAMES / 2)) % FRAMES;
 				if (frame < maxFrame)
 				{
 					//Make sure thread is done
 					if (threads[t].joinable())
 						threads[t].join();
 
-					//Read new frame
-					input >> frames[frame % FRAMES];
-					cvtColor(frames[frame % FRAMES], framesGray[frame % FRAMES], COLOR_BGR2GRAY);
-
+					//Read new frame if available
+					if (framePos < maxFrame)
+					{
+						input >> frames[framePos];
+						cvtColor(frames[framePos], framesGray[framePos], COLOR_BGR2GRAY);
+					}
+					
+					//Launch thread
 					threadFrameIndex[t] = frame;
 					threadBusy[t] = true;
 					threads[t] = thread(analyzeFrame, frame, t);
