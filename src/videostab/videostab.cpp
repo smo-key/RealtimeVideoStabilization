@@ -6,12 +6,13 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <signal.h>
 
 using namespace std;
 using namespace cv;
 
 const unsigned int THREADS = 8;
-const unsigned int SMOOTHING_RADIUS = 60;
+const unsigned int SMOOTHING_RADIUS = 20;
 #define USE_GPU
 
 struct RigidTransform
@@ -68,103 +69,124 @@ VideoWriter output;
 mutex outputLock;
 mutex coutLock;
 
-UMat frames[THREADS];
-UMat framesGray[THREADS];
 Mat framesOut[THREADS];
 bool threadBusy[THREADS];
 bool threadWriteLock[THREADS]; //Write locks
 
-const unsigned int FRAMES = max(THREADS + 1, SMOOTHING_RADIUS);
+const unsigned int FRAMES = max(THREADS, SMOOTHING_RADIUS);
+Mat frames[FRAMES];
+Mat framesGray[FRAMES];
 RigidTransform framesT[FRAMES];
-RigidTransform framesTTemp[THREADS];
 RigidTransform frameZero = RigidTransform();
 
 void calculateDt(const unsigned int i, const unsigned int threadId, bool storeFinal=true)
 {
+	//Loop around when we are at the end of the array
+	const int idCur = i % FRAMES;
+	int idPrev = (idCur - 1);
+	idPrev = (idPrev < 0) ? FRAMES - 1 : idPrev;
+
 	if (!storeFinal)
 	{
 		coutLock.lock();
-		cout << "Precalculating frame " << i << " (thread " << threadId << ")" << endl;
+		cout << "Precalculating frame " << i << " (thread " << threadId << ") ID: " << idPrev << "," << idCur << endl;
 		coutLock.unlock();
 	}
 
-	//Loop around when we are at the end of the array
-	const unsigned int idCur = i % FRAMES;
-	const unsigned int idPrev = i - 1 % FRAMES;
-
 	//Store into temp matrices
-	UMat matCur = frames[threadId % THREADS];
-	UMat matPrev = frames[threadId - 1 % THREADS];
-	UMat greyCur = framesGray[threadId % THREADS];
-	UMat greyPrev = framesGray[threadId - 1 % THREADS];
+	Mat matCur = frames[idCur];
+	Mat matPrev = frames[idPrev];
+	Mat greyCur = framesGray[idCur];
+	Mat greyPrev = framesGray[idPrev];
 
 	//Lock necessary variables
 	//framesLock[idCur].lock();
 	//framesLock[idPrev].lock();
 
 	//Keypoint vectors and status vectors
-	vector <Point2f> _keypointPrev, _keypointCur, keypointPrev, keypointCur;
-	vector <uchar> status;
-	vector <float> err;
+	vector <Point2f> _keypointPrev, _keypointCur
+		, keypointPrev, keypointCur;
 
 	//Find good features
 	goodFeaturesToTrack(greyPrev, _keypointPrev, 500, 0.0005, 3);
 
-	//Calculate optical flow
-	calcOpticalFlowPyrLK(greyPrev, greyCur, _keypointPrev, _keypointCur, status, err);
+	//Output
+	RigidTransform dT;
 
-	//Remove bad matches
-	for (size_t i = 0; i < status.size(); i++)
+	if (_keypointPrev.size() != 0)
 	{
-		if (status[i])
+		vector <uchar> status = vector<uchar>();
+		vector <float> err = vector<float>();
+
+		//Calculate optical flow
+		calcOpticalFlowPyrLK(greyPrev, greyCur, _keypointPrev, _keypointCur, status, err);
+
+		//Remove bad matches
+		for (size_t i = 0; i < status.size(); i++)
 		{
-			keypointPrev.push_back(_keypointPrev[i]);
-			keypointCur.push_back(_keypointCur[i]);
+			if (status[i])
+			{
+				keypointPrev.push_back(_keypointPrev[i]);
+				keypointCur.push_back(_keypointCur[i]);
+			}
 		}
+
+		//Estimate transformation with translation and rotation only
+		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false); //false = rigid
+
+		//Decompose transformation matrix
+		double dx = matT.at<double>(0, 2);
+		double dy = matT.at<double>(1, 2);
+		double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
+		dT = RigidTransform(dx, dy, da);
 	}
-
-	//Estimate transformation with translation and rotation only
-	Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false); //false = rigid
-
-	//Decompose transformation matrix
-	double dx = matT.at<double>(0, 2);
-	double dy = matT.at<double>(1, 2);
-	double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
-	RigidTransform dT(dx, dy, da);
+	else
+	{
+		dT = RigidTransform();
+	}
 
 	//Store variables now (used when preprocessing frames)
 	if (storeFinal)
+	{
 		framesT[idCur] = dT;		//Write current transform to final array
+	}
 	else
-		framesTTemp[threadId] = dT; //Write current transform to temp array
+	{
+		framesT[idCur] = dT; //Write current transform to temp array
+		threadBusy[threadId] = false;
+	}
 }
 
 void analyzeFrame(const unsigned int i, const unsigned int threadId)
 {
+	//Loop around when we are at the end of the array
+	int idCur = i % FRAMES;
+	int idPrev = (idCur - 1);
+	idPrev = (idPrev < 0) ? FRAMES - 1 : idPrev;
+
 	coutLock.lock();
-	cout << "Analyzing frame " << i << " (thread " << threadId << ")" << endl;
+	//cout << "Analyzing frame " << i << " (thread " << threadId << ") ID: " << idPrev << "," << idCur << endl;
 	coutLock.unlock();
 
-	//Loop around when we are at the end of the array
-	const unsigned int idCur = i % FRAMES;
-	const unsigned int idPrev = i - 1 % FRAMES;
-
 	//Store into temp matrices
-	UMat* matCur = &frames[threadId % THREADS];
-	UMat* matPrev = &frames[threadId - 1 % THREADS];
-	UMat* greyCur = &framesGray[threadId % THREADS];
-	UMat* greyPrev = &framesGray[threadId - 1 % THREADS];
+	Mat* matCur = &frames[idCur];
+	Mat* matPrev = &frames[idPrev];
+	Mat* greyCur = &framesGray[idCur];
+	Mat* greyPrev = &framesGray[idPrev];
 
 	//Calculate transform difference for the frame
-	calculateDt(i, threadId);
-	RigidTransform dT = framesT[i];
+	if (i >= FRAMES)
+		calculateDt(i, threadId);
+	RigidTransform dT = framesT[idCur];
+	if (idCur == 0)
+		frameZero = dT;
 
 	//Smooth transformation using an averaging window
 	RigidTransform T(frameZero);
 	//Skip the current frame (we didn't put it into our vector yet)
 	for (size_t i = idCur + 1; i < FRAMES + idCur; i++)
 	{
-		T += framesT[i % FRAMES];
+		T += framesT[i % FRAMES + 1];
 	}
 	//Now add in the current frame
 	T += dT;
@@ -178,6 +200,10 @@ void analyzeFrame(const unsigned int i, const unsigned int threadId)
 	Mat out;
 	warpAffine(*matCur, out, frameTransform, matCur->size());
 
+	coutLock.lock();
+	//cout << "Wait      frame " << i << " (thread " << threadId << ") ID: " << idPrev << "," << idCur << endl;
+	coutLock.unlock();
+
 	//Wait for the frame occupying the thread has been written
 	while (threadWriteLock[threadId])
 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -189,6 +215,10 @@ void analyzeFrame(const unsigned int i, const unsigned int threadId)
 
 	//Done with frame
 	threadBusy[threadId] = false;
+
+	coutLock.lock();
+	//cout << "Done      frame " << i << " (thread " << threadId << ") ID: " << idPrev << "," << idCur << endl;
+	coutLock.unlock();
 }
 
 void startThreads()
@@ -197,67 +227,94 @@ void startThreads()
 	input.set(CV_CAP_PROP_POS_FRAMES, 0); //reset frame position
 	const unsigned int maxFrame = input.get(CV_CAP_PROP_FRAME_COUNT);
 
-	//Preprocess first first few frames for transform matrix
+	//Prepare threading variables
+	unsigned int frame = 1; //next frame to process
 	thread threads[THREADS];
-	unsigned int threadId = 0;
-	for (size_t frame = 1; frame < min(FRAMES, maxFrame) - 1; frame++)
-	{
-		//Get the frame
-		input >> frames[frame];
-		cvtColor(frames[frame], framesGray[frame], COLOR_BGR2GRAY);
-
-		//Spawn transform calculation thread
-		threads[frame] = thread(calculateDt, frame, (frame - 1) % THREADS, false);
-	}
-	//Wait for threads to finish
 	for (size_t i = 0; i < THREADS; i++)
 	{
-		threads[i].join();
-		threadBusy[i] = true; //set this flag for later
-		threadWriteLock[i] = false;
+		threadBusy[i] = false;		//clear this flag so threads can spin up
+		threadWriteLock[i] = false; //open write lock flag so first frames can be written
 	}
 
-	//Start main threading
-	input.set(CV_CAP_PROP_POS_FRAMES, 0);
-	unsigned int frame = 1; //next frame to process
+	//Read in first frame
+	input >> frames[0];
+	cvtColor(frames[0], framesGray[0], COLOR_BGR2GRAY);
 
-	//Start first few threads
-	for (frame = 1; frame < min(THREADS, maxFrame - 1); frame++)
-	{
-		//Spawn transform calculation thread
-		threads[frame-1] = thread(analyzeFrame, frame, (frame - 1) % THREADS);
-	}
-	frame = 1 + THREADS;
-	
-	//Run all threads, checking for completion
-	unsigned int frameWrite = 1; //next frame to write
-	unsigned int threadFrameIndex[THREADS];
-	while (frame < maxFrame)
+	//Preprocess first first few frames for transform matrix
+	while (frame < FRAMES)
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
 			if (!threadBusy[t])
 			{
-				//While we have the next frame to write, do it
-				for (int tWrite = 0; tWrite < THREADS; tWrite++)
-				{
-					if (threadFrameIndex[tWrite] == frameWrite)
-					{
-						coutLock.lock();
-						cout << "Writing frame " << frameWrite << " (thread " << tWrite << ")" << endl;
-						coutLock.unlock();
-						output.write(framesOut[tWrite]);
-						threadWriteLock[tWrite] = false;
-						frameWrite++;
-					}
-				}
-
 				//Launch new frame, if another exists
-				if (frame < maxFrame)
+				if (frame < FRAMES)
 				{
+					if (threads[t].joinable())
+						threads[t].join();
+
 					//Read new frame
 					input >> frames[frame];
 					cvtColor(frames[frame], framesGray[frame], COLOR_BGR2GRAY);
+
+					threadBusy[t] = true;
+					threads[t] = thread(calculateDt, frame, t, false);
+					frame++;
+				}
+			}
+		}
+		//Sleep a bit before checking again
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+
+	//Wait for threads to finish, then reset vars again
+	unsigned int threadFrameIndex[THREADS];
+	for (size_t i = 0; i < THREADS; i++)
+	{
+		threads[i].join();
+		threadBusy[i] = false;		//unset flag so we can analyze data
+		threadWriteLock[i] = false; //open write lock flag so first frames can be written
+		threadFrameIndex[i] = -1;
+	}
+
+	//Start main threading
+	input.set(CV_CAP_PROP_POS_FRAMES, 0);
+
+	//Ignore first frame
+	input >> frames[0];
+	cvtColor(frames[0], framesGray[0], COLOR_BGR2GRAY);
+
+	frame = 1;
+	
+	//Run all threads, checking for completion
+	unsigned int frameWrite = 1; //next frame to write
+	while (frameWrite < maxFrame)
+	{
+		for (int t = 0; t < THREADS; t++)
+		{
+			//While we have the next frame to write, do it
+			if (threadFrameIndex[t] == frameWrite && threadWriteLock[t])
+			{
+				coutLock.lock();
+				cout << "Writing   frame " << frameWrite << " (thread " << t << ")" << endl;
+				coutLock.unlock();
+				output.write(framesOut[t]);
+				threadWriteLock[t] = false;
+				frameWrite++;
+			}
+
+			if (!threadBusy[t] && !threadWriteLock[t])
+			{
+				//Launch new frame, if another exists
+				if (frame < maxFrame)
+				{
+					//Make sure thread is done
+					if (threads[t].joinable())
+						threads[t].join();
+
+					//Read new frame
+					input >> frames[frame % FRAMES];
+					cvtColor(frames[frame % FRAMES], framesGray[frame % FRAMES], COLOR_BGR2GRAY);
 
 					threadFrameIndex[t] = frame;
 					threadBusy[t] = true;
@@ -273,8 +330,23 @@ void startThreads()
 	//Wait for all threads to end
 	for (size_t i = 0; i < THREADS; i++)
 	{
-		threads[i].join();
+		if (threads[i].joinable())
+			threads[i].join();
+		//threads[i].detach();
 	}
+	return;
+}
+
+void handleSignal(int sig)
+{
+	cout << "Signal " << sig << " caught. Exiting safely..." << endl;
+
+	//Close streams
+	/*input.release();
+	output.release();
+
+	terminate();
+	exit(0);*/
 }
 
 int main(int argc, char** argv)
@@ -290,6 +362,11 @@ int main(int argc, char** argv)
 		cout << "-G          Use GPU (default=no)" << endl;
 		cout << "-Tn         Use n threads (default=4)" << endl;
 	}
+
+	//Catch escape signals
+	//signal(SIGABRT, &handleSignal);
+	signal(SIGTERM, &handleSignal);
+	signal(SIGINT, &handleSignal);
 
 	//Prepare input video
 	input = VideoCapture(argv[1]);
@@ -309,6 +386,10 @@ int main(int argc, char** argv)
 
 	//Start threads
 	startThreads();
+
+	//Close streams
+	input.release();
+	output.release();
 
 	//Exit
 	return 0;
