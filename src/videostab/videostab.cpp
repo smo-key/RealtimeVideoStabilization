@@ -38,10 +38,28 @@ public:
 		this->angle += other.angle;
 		return *this;
 	}
+	RigidTransform& operator-=(const RigidTransform &other) {
+		this->x -= other.x;
+		this->y -= other.y;
+		this->angle -= other.angle;
+		return *this;
+	}
 	RigidTransform& operator/=(const int &other) {
 		this->x /= other;
 		this->y /= other;
 		this->angle /= other;
+		return *this;
+	}
+	RigidTransform operator+(const RigidTransform &other) {
+		this->x += other.x;
+		this->y += other.y;
+		this->angle += other.angle;
+		return *this;
+	}
+	RigidTransform operator-(const RigidTransform &other) {
+		this->x -= other.x;
+		this->y -= other.y;
+		this->angle -= other.angle;
 		return *this;
 	}
 
@@ -82,38 +100,28 @@ unsigned int frameWriting = 0;				//current frame being written
 
 const unsigned int FRAMES = SMOOTHING_RADIUS * 2;	//2*frames needed for a single frame to be ready to write
 const unsigned int FRAMEBUFFER = FRAMES + THREADS;	//frame buffer size
-RigidTransform framesT[FRAMEBUFFER];				//parsed frame transformation deltas
-RigidTransform framesSumT[FRAMEBUFFER];				//sum of all frames in position from previous framesT
-													//framesT is reset to zeroed every overlap, but values are added to framesSumT
-
-/*
-New algorithm:
-
-In parallel:
-a. Find transform of threadMat (THREADS at a time) up to current frame needed -> framesT
-b. Stabilize threadMat (THREADS at a time)
-	1. Wait until all threadAnalyzeFrames are above FRAMES_ANALYZED + frame being processed
-	2. Stabilize frame
-	3. Wait for this frame to be the next to write (check frameStabilizing)
-	4. Write frame to output
-*/
+RigidTransform framesT[FRAMEBUFFER];				//parsed frame transformation deltas (biased)
+RigidTransform framesTOrig[FRAMEBUFFER];			//parsed frame transformation deltas (original)
+RigidTransform framesTBias;							//sum of all frames in position from previous framesT
+													//framesT is reset to zeroed every overlap, but values are added to framesTBias
+mutex framesBiasLock;								//when locked, make sure no one can access the sum framesT
 
 static void wait(int millis)
 {
 	this_thread::sleep_for(std::chrono::milliseconds(millis));
 }
 
-void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat mat, Mat prevMat)
+void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat, Mat& prevMat)
 {
 	const int id = frame % FRAMEBUFFER;
 
-	Mat grayCur, grayPrev;
+	Mat grayCur = Mat(), grayPrev = Mat();
 	cvtColor(mat, grayCur, COLOR_BGR2GRAY);
 	cvtColor(prevMat, grayPrev, COLOR_BGR2GRAY);
 
 	//Keypoint vectors and status vectors
-	vector <Point2f> _keypointPrev, _keypointCur
-		, keypointPrev, keypointCur;
+	vector <Point2f> _keypointPrev = vector<Point2f>(), _keypointCur = vector<Point2f>()
+		, keypointPrev = vector<Point2f>(), keypointCur = vector<Point2f>();
 
 	//Find good features
 	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.0005, 3);
@@ -154,30 +162,108 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat mat, 
 	}
 
 	//Finalize output
+	framesBiasLock.lock();
 	framesT[id] = dT;
+	framesTOrig[id] = dT;
+
+	/*if (id == 0) {
+		//We need to flush the buffer and update it with equivalent values
+		//This allows us to keep track of an overall sum, not just a dT
+
+		//First, make sure no one else is reading from it
+		
+		framesTBias = dT;
+		for (int i = 0; i < FRAMEBUFFER; i++)
+		{
+			framesT[i] -= dT;
+		}
+	}*/
+	framesBiasLock.unlock();
 
 	//Prepare for another thread
 	framesAnalyzed++;
 	threadAnalyzeBusy[thread] = false;
 }
 
-void stabilizeFrame(const unsigned int frame, const unsigned int thread, Mat mat)
+void stabilizeFrame(const unsigned int frameCount, const unsigned int frame, const unsigned int thread, Mat& mat)
 {
+	//Find frames
+	const unsigned int frameMin = frame < SMOOTHING_RADIUS ? 0 : frame - SMOOTHING_RADIUS;
+	const unsigned int frameMax = frame + SMOOTHING_RADIUS > frameCount ? frameCount : frame + SMOOTHING_RADIUS;  //we're *HOPEFULLY* not going to overflow this
+	const unsigned int frameReset = (framesAnalyzed - (framesAnalyzed % FRAMEBUFFER)); //floor to nearest 24
+
+	//Get buffer indices
+	const unsigned int idMin = frameMin % FRAMEBUFFER;
+	const unsigned int idMax = frameMax % FRAMEBUFFER;
+
+	//Get dT for the current frame
+	framesBiasLock.lock(); //make sure no one else is writing
+	RigidTransform t_i = framesTOrig[frame % FRAMEBUFFER];
+
+	//Accumulate dT over entire time span to get a linear trajectory for the frame
+	RigidTransform t_linear = framesTBias; //start with the bias and add up all frames until now
+	if (frame < frameReset)
+	{
+		//The bias reset already happened, so our frame starts near the end
+		//We essentially subtract the leftovers of the bias because those frames are excluded
+		for (int i = frame % FRAMEBUFFER; i < FRAMEBUFFER; i++)
+		{
+			t_linear += framesT[i];
+		}
+	}
+	else
+	{
+		for (int i = 0; i <= frame % FRAMEBUFFER; i++)
+		{
+			t_linear += framesT[i];
+		}
+	}
+
+	//Average dT over the select time span only to get a smoothed trajectory
+	RigidTransform t_smoothed(0, 0, 0);
+	if (idMax < idMin)
+	{
+		//Two (non-overlapping) ranges
+		for (int i = idMin; i < FRAMEBUFFER; i++)
+		{
+			t_smoothed += framesTOrig[i];
+		}
+		for (int i = 0; i <= idMax; i++)
+		{
+			t_smoothed += framesTOrig[i];
+		}
+	}
+	else
+	{
+		//Single (typical) range
+		//for (int)
+		for (int i = idMin; i <= idMax; i++)
+		{
+			t_smoothed += framesTOrig[i];
+		}
+	}
+	t_smoothed /= (2 * SMOOTHING_RADIUS);
+	framesBiasLock.unlock(); //we're done, so unlock
+
+	//Find the difference between linear and smoothed versions to get a transform function for this frame
+	RigidTransform t = t_i;// + t_smoothed - t_linear;
+
 	//Find the accumulated dT
-	RigidTransform transform = framesT[frame % FRAMEBUFFER];
+	//RigidTransform transform = framesT[frame % FRAMEBUFFER];
 
 	//Calculate transform matrix
-	Mat T = transform.makeMatrix();
+	Mat T = t.makeMatrix();
 
 	//Transform frame
-	warpAffine(mat, mat, T, mat.size());
+	Mat out;
+	warpAffine(mat, out, T, mat.size());
 
 	//Wait for thread write lock to release
 	while (threadWriteLock[thread])
 		wait(5);
 
 	//Write out transformation
-	framesStabilizeOut[thread] = mat;
+	framesStabilizeOut[thread] = out;
 
 	//Prepare for another thread
 	threadWriteLock[thread] = true;			//Wait to write
@@ -196,7 +282,7 @@ void writeFrames(const unsigned int frameCount)
 				coutLock.lock();
 				cout << "Writing     frame " << frameWriting << endl;
 				coutLock.unlock();
-				output << framesStabilizeOut[t];
+				output.write(framesStabilizeOut[t]);
 				threadWriteLock[t] = false;
 				frameWriting++;
 			}
@@ -222,10 +308,8 @@ void startThreads()
 	//Set initial variables
 	Mat tmp;
 	framesT[0] = RigidTransform(0, 0, 0);
-	for (int f = 0; f < FRAMEBUFFER; f++)
-	{
-		framesSumT[f] = RigidTransform(0, 0, 0);
-	}
+	framesTOrig[0] = RigidTransform(0, 0, 0);
+	framesTBias = RigidTransform(0, 0, 0);
 
 	//Prepare threading
 	thread analysisThreads[THREADS];
@@ -239,8 +323,8 @@ void startThreads()
 	
 	//Write in first frame without transformation (for now)
 	inputAnalyze >> tmp;
-	output << tmp;
-	Mat prevFrameAnalyzed = tmp;
+	output.write(tmp);
+	Mat prevFrameAnalyzed = tmp.clone();
 
 	//Start frame writer
 	thread writeThread = thread(writeFrames, frameCount);
@@ -273,7 +357,7 @@ void startThreads()
 				coutLock.unlock();
 
 				//Spawn new analysis thread
-				analysisThreads[t] = thread(analyzeFrame, frameAnalyzing, t, tmp, prevFrameAnalyzed);
+				analysisThreads[t] = thread(analyzeFrame, frameAnalyzing, t, tmp.clone(), prevFrameAnalyzed.clone());
 
 				//Prepare for another to spawn
 				frameAnalyzing++;
@@ -305,7 +389,7 @@ void startThreads()
 				coutLock.unlock();
 
 				//Launch thread
-				stabilizeThreads[t] = thread(stabilizeFrame, frameStabilizing, t, tmp);
+				stabilizeThreads[t] = thread(stabilizeFrame, frameCount, frameStabilizing, t, tmp.clone());
 
 				//Prepare for another to spawn
 				frameStabilizing++;
@@ -364,13 +448,21 @@ int main(int argc, char** argv)
 	inputStabilize = VideoCapture(argv[1]);
 	assert(inputStabilize.isOpened());
 
+	//Prepare output video stream
+	output = VideoWriter(argv[2],
+		inputAnalyze.get(CV_CAP_PROP_FOURCC),
+		inputAnalyze.get(CV_CAP_PROP_FPS),
+		Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
+			inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT)));
+	assert(output.isOpened());
+
 	//Main operation
 	startThreads();
 
 	//Exit!
 	cout << "Done! Closing files and exiting..." << endl;
-	inputAnalyze.~VideoCapture();
-	inputStabilize.~VideoCapture();
-	output.~VideoWriter();
+	inputAnalyze.release();
+	inputStabilize.release();
+	output.release();
 	return 0;
 }
