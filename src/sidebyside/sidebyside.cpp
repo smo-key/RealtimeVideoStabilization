@@ -19,7 +19,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	// Setup input video
+	// Setup inputAnalyze video
 	VideoCapture before(argv[1]);
 	assert(before.isOpened());
 
