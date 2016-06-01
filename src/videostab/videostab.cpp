@@ -62,6 +62,12 @@ public:
 		this->angle -= other.angle;
 		return *this;
 	}
+	RigidTransform operator*(const int &other) {
+		this->x *= other;
+		this->y *= other;
+		this->angle *= other;
+		return *this;
+	}
 
 	Mat makeMatrix()
 	{
@@ -97,6 +103,8 @@ unsigned int frameAnalyzing = 0;			//current frame being analyzed
 unsigned int framesAnalyzed = -1;			//last frame to be analyzed
 unsigned int frameStabilizing = 0;			//current frame being stabilized
 unsigned int frameWriting = 0;				//current frame being written
+bool running = true;						//when false, begin termination
+bool terminated = false;					//when true, all threads are done
 
 const unsigned int FRAMES = SMOOTHING_RADIUS * 2;	//2*frames needed for a single frame to be ready to write
 const unsigned int FRAMEBUFFER = FRAMES + THREADS;	//frame buffer size
@@ -115,7 +123,7 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 {
 	const int id = frame % FRAMEBUFFER;
 
-	Mat grayCur = Mat(), grayPrev = Mat();
+	Mat grayCur, grayPrev;
 	cvtColor(mat, grayCur, COLOR_BGR2GRAY);
 	cvtColor(prevMat, grayPrev, COLOR_BGR2GRAY);
 
@@ -127,9 +135,9 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.0005, 3);
 
 	//Output
-	RigidTransform dT;
+	RigidTransform dT(0, 0, 0);
 
-	if (_keypointPrev.size() != 0)
+	if (_keypointPrev.size() > 0)
 	{
 		vector <uchar> status = vector<uchar>();
 		vector <float> err = vector<float>();
@@ -150,15 +158,15 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 		//Estimate transformation with translation and rotation only
 		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false); //false = rigid
 
-		//Decompose transformation matrix
-		double dx = matT.at<double>(0, 2);
-		double dy = matT.at<double>(1, 2);
-		double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
-		dT = RigidTransform(dx, dy, da);
-	}
-	else
-	{
-		dT = RigidTransform();
+		//Sometimes, no transformation could be found
+		if ((matT.rows == 2) && (matT.cols == 3))
+		{
+			//Decompose transformation matrix
+			double dx = matT.at<double>(0, 2);
+			double dy = matT.at<double>(1, 2);
+			double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
+			dT = RigidTransform(dx, dy, da);
+		}
 	}
 
 	//Finalize output
@@ -166,18 +174,24 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 	framesT[id] = dT;
 	framesTOrig[id] = dT;
 
-	/*if (id == 0) {
+	if (id == 0) {
 		//We need to flush the buffer and update it with equivalent values
 		//This allows us to keep track of an overall sum, not just a dT
 
 		//First, make sure no one else is reading from it
 		
-		framesTBias = dT;
+		RigidTransform sumT(0, 0, 0);
 		for (int i = 0; i < FRAMEBUFFER; i++)
 		{
-			framesT[i] -= dT;
+			sumT += framesT[i];
 		}
-	}*/
+
+		framesTBias += sumT;
+		/*for (int i = 0; i < FRAMEBUFFER; i++)
+		{
+			framesT[i] -= dT;
+		}*/
+	}
 	framesBiasLock.unlock();
 
 	//Prepare for another thread
@@ -201,14 +215,15 @@ void stabilizeFrame(const unsigned int frameCount, const unsigned int frame, con
 	RigidTransform t_i = framesTOrig[frame % FRAMEBUFFER];
 
 	//Accumulate dT over entire time span to get a linear trajectory for the frame
-	RigidTransform t_linear = framesTBias; //start with the bias and add up all frames until now
+	RigidTransform t_linear(0, 0, 0);
+	t_linear += framesTBias; //start with the bias and add up all frames until now
 	if (frame < frameReset)
 	{
 		//The bias reset already happened, so our frame starts near the end
 		//We essentially subtract the leftovers of the bias because those frames are excluded
 		for (int i = frame % FRAMEBUFFER; i < FRAMEBUFFER; i++)
 		{
-			t_linear += framesT[i];
+			t_linear -= framesT[i];
 		}
 	}
 	else
@@ -246,7 +261,7 @@ void stabilizeFrame(const unsigned int frameCount, const unsigned int frame, con
 	framesBiasLock.unlock(); //we're done, so unlock
 
 	//Find the difference between linear and smoothed versions to get a transform function for this frame
-	RigidTransform t = t_i;// + t_smoothed - t_linear;
+	RigidTransform t = t_i + t_smoothed - t_linear;
 
 	//Find the accumulated dT
 	//RigidTransform transform = framesT[frame % FRAMEBUFFER];
@@ -272,7 +287,7 @@ void stabilizeFrame(const unsigned int frameCount, const unsigned int frame, con
 
 void writeFrames(const unsigned int frameCount)
 {
-	while (frameWriting < frameCount)
+	while (frameWriting < frameCount && running)
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
@@ -330,7 +345,7 @@ void startThreads()
 	thread writeThread = thread(writeFrames, frameCount);
 
 	//Run all threads until everything is written
-	while (frameStabilizing < frameCount)
+	while (frameStabilizing < frameCount && running)
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
@@ -360,6 +375,7 @@ void startThreads()
 				analysisThreads[t] = thread(analyzeFrame, frameAnalyzing, t, tmp.clone(), prevFrameAnalyzed.clone());
 
 				//Prepare for another to spawn
+				tmp.copyTo(prevFrameAnalyzed);
 				frameAnalyzing++;
 			}
 
@@ -408,17 +424,27 @@ void startThreads()
 		if (stabilizeThreads[i].joinable())
 			stabilizeThreads[i].join();
 	}
+
+	terminated = true;
 }
 
 void handleSignal(int sig)
 {
 	cout << "Signal " << sig << " caught. Exiting safely..." << endl;
 
-	//Close streams
-	inputAnalyze.~VideoCapture();
-	output.~VideoWriter();
+	//Raise exit flag
+	running = false;
 
-	terminate();
+	//Wait for threads to terminate
+	while (!terminated)
+		wait(50);
+
+	//Close streams
+	output.release();
+	inputAnalyze.release();
+	inputStabilize.release();
+
+	//Exit
 	exit(0);
 }
 
