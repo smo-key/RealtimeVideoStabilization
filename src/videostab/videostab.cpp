@@ -11,8 +11,8 @@
 using namespace std;
 using namespace cv;
 
-const unsigned int THREADS = 4;
-const unsigned int SMOOTHING_RADIUS = 10;
+const unsigned int THREADS = 6;
+const unsigned int FRAMEBUFFER = 16;
 
 struct RigidTransform
 {
@@ -50,23 +50,17 @@ public:
 		this->angle /= other;
 		return *this;
 	}
-	RigidTransform operator+(const RigidTransform &other) {
-		this->x += other.x;
-		this->y += other.y;
-		this->angle += other.angle;
-		return *this;
+	friend RigidTransform operator+(const RigidTransform &c1, const RigidTransform  &c2) {
+		return RigidTransform(c1.x + c2.x, c1.y + c2.y, c1.angle + c2.angle);
 	}
-	RigidTransform operator-(const RigidTransform &other) {
-		this->x -= other.x;
-		this->y -= other.y;
-		this->angle -= other.angle;
-		return *this;
+	friend RigidTransform operator-(const RigidTransform &c1, const RigidTransform  &c2) {
+		return RigidTransform(c1.x - c2.x, c1.y - c2.y, c1.angle - c2.angle);
 	}
-	RigidTransform operator*(const int &other) {
-		this->x *= other;
-		this->y *= other;
-		this->angle *= other;
-		return *this;
+	friend RigidTransform operator*(const RigidTransform &c1, const RigidTransform  &c2) {
+		return RigidTransform(c1.x*c2.x, c1.y*c2.y, c1.angle*c2.angle);
+	}
+	friend RigidTransform operator/(const RigidTransform &c1, const RigidTransform  &c2) {
+		return RigidTransform(c1.x / c2.x, c1.y / c2.y, c1.angle / c2.angle);
 	}
 
 	Mat makeMatrix()
@@ -86,6 +80,12 @@ public:
 	}
 };
 
+//Kalman filter constants
+const double Q_val = 4e-3; //4e-3
+const double R_val = 0.25; //0.25
+RigidTransform Q(Q_val, Q_val, Q_val); // process noise covariance
+RigidTransform R(R_val, R_val, R_val); // measurement noise covariance 
+
 //Video I/O
 VideoCapture inputAnalyze;
 VideoCapture inputStabilize;
@@ -94,11 +94,7 @@ mutex coutLock;
 
 //Threading
 unsigned int threadAnalyzeFrame[THREADS];	//index of frames each ANALYZE thread is processing
-unsigned int threadStabilizeFrame[THREADS];	//index of frames each STABILIZE thread is processing
-Mat framesStabilizeOut[THREADS];						//output from each thread
 bool threadAnalyzeBusy[THREADS];			//threads busy processing and cannot be respawned
-bool threadStabilizeBusy[THREADS];			//threads busy processing and cannot be respawned
-bool threadWriteLock[THREADS];				//STABILIZE threads waiting to write new frame
 unsigned int frameAnalyzing = 0;			//current frame being analyzed
 unsigned int framesAnalyzed = -1;			//last frame to be analyzed
 unsigned int frameStabilizing = 0;			//current frame being stabilized
@@ -106,13 +102,9 @@ unsigned int frameWriting = 0;				//current frame being written
 bool running = true;						//when false, begin termination
 bool terminated = false;					//when true, all threads are done
 
-const unsigned int FRAMES = SMOOTHING_RADIUS * 2;	//2*frames needed for a single frame to be ready to write
-const unsigned int FRAMEBUFFER = FRAMES + THREADS;	//frame buffer size
-RigidTransform framesT[FRAMEBUFFER];				//parsed frame transformation deltas (biased)
-RigidTransform framesTOrig[FRAMEBUFFER];			//parsed frame transformation deltas (original)
-RigidTransform framesTBias;							//sum of all frames in position from previous framesT
-													//framesT is reset to zeroed every overlap, but values are added to framesTBias
-mutex framesBiasLock;								//when locked, make sure no one can access the sum framesT
+RigidTransform framesT[FRAMEBUFFER];			//parsed frame transformation deltas
+Mat frames[FRAMEBUFFER];						//an actual frame buffer between stab and write threads
+RigidTransform X, P, K;							//Kalman filter global variables
 
 static void wait(int millis)
 {
@@ -128,8 +120,11 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 	cvtColor(prevMat, grayPrev, COLOR_BGR2GRAY);
 
 	//Keypoint vectors and status vectors
-	vector <Point2f> _keypointPrev = vector<Point2f>(), _keypointCur = vector<Point2f>()
-		, keypointPrev = vector<Point2f>(), keypointCur = vector<Point2f>();
+	vector <Point2f> _keypointPrev = vector<Point2f>();
+	_keypointPrev.reserve(500);
+	vector <Point2f>_keypointCur = vector<Point2f>();
+	vector <Point2f> keypointPrev = vector<Point2f>();
+	vector <Point2f> keypointCur = vector<Point2f>();
 
 	//Find good features
 	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.0005, 3);
@@ -156,8 +151,8 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 		}
 
 		//Estimate transformation with translation and rotation only
-		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false); //false = rigid
-
+		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false);
+		
 		//Sometimes, no transformation could be found
 		if ((matT.rows == 2) && (matT.cols == 3))
 		{
@@ -170,137 +165,103 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 	}
 
 	//Finalize output
-	framesBiasLock.lock();
 	framesT[id] = dT;
-	framesTOrig[id] = dT;
-
-	if (id == 0) {
-		//We need to flush the buffer and update it with equivalent values
-		//This allows us to keep track of an overall sum, not just a dT
-
-		//First, make sure no one else is reading from it
-		
-		RigidTransform sumT(0, 0, 0);
-		for (int i = 0; i < FRAMEBUFFER; i++)
-		{
-			sumT += framesT[i];
-		}
-
-		framesTBias += sumT;
-		/*for (int i = 0; i < FRAMEBUFFER; i++)
-		{
-			framesT[i] -= dT;
-		}*/
-	}
-	framesBiasLock.unlock();
 
 	//Prepare for another thread
 	framesAnalyzed++;
 	threadAnalyzeBusy[thread] = false;
 }
 
-void stabilizeFrame(const unsigned int frameCount, const unsigned int frame, const unsigned int thread, Mat& mat)
+/*
+Stabilize a frame.
+
+This method is guaranteed to run in series (i.e. all frames in order, and one at a time).
+As such, this method should run as quickly as possible. Offload any processing possible
+to analyzeFrame();
+*/
+void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, Mat& mat)
 {
-	//Find frames
-	const unsigned int frameMin = frame < SMOOTHING_RADIUS ? 0 : frame - SMOOTHING_RADIUS;
-	const unsigned int frameMax = frame + SMOOTHING_RADIUS > frameCount ? frameCount : frame + SMOOTHING_RADIUS;  //we're *HOPEFULLY* not going to overflow this
-	const unsigned int frameReset = (framesAnalyzed - (framesAnalyzed % FRAMEBUFFER)); //floor to nearest 24
+	//Kalman filter local variables
+	RigidTransform P_, X_;
 
-	//Get buffer indices
-	const unsigned int idMin = frameMin % FRAMEBUFFER;
-	const unsigned int idMax = frameMax % FRAMEBUFFER;
+	//X		= posteriori state estimate (i.e. result of calculation)
+	//X_	= priori state estimate
+	//P		= posteriori estimate error covariance
+	//P_	= priori estiate error covariance
+	//K		= gain
+	//Z		= current measurement
 
-	//Get dT for the current frame
-	framesBiasLock.lock(); //make sure no one else is writing
-	RigidTransform t_i = framesTOrig[frame % FRAMEBUFFER];
+	//Update Kalman filter predictions
+	X_ = X;									//X_(k) = X(k-1);
+	P_ = P + Q;								//P_(k) = P(k-1)+Q;
 
-	//Accumulate dT over entire time span to get a linear trajectory for the frame
-	RigidTransform t_linear(0, 0, 0);
-	t_linear += framesTBias; //start with the bias and add up all frames until now
-	if (frame < frameReset)
-	{
-		//The bias reset already happened, so our frame starts near the end
-		//We essentially subtract the leftovers of the bias because those frames are excluded
-		for (int i = frame % FRAMEBUFFER; i < FRAMEBUFFER; i++)
-		{
-			t_linear -= framesT[i];
-		}
-	}
-	else
-	{
-		for (int i = 0; i <= frame % FRAMEBUFFER; i++)
-		{
-			t_linear += framesT[i];
-		}
-	}
+	//Measurement correction
+	K = P_ / (P_ + R);						//K(k) = P_(k)/( P_(k)+R );
+	X = X_ + K*(Z - X_);					//z-X_ is residual, X(k) = X_(k)+K(k)*(z(k)-X_(k)); 
+	P = (RigidTransform(1, 1, 1) - K)*P_;	//P(k) = (1-K(k))*P_(k);
 
-	//Average dT over the select time span only to get a smoothed trajectory
-	RigidTransform t_smoothed(0, 0, 0);
-	if (idMax < idMin)
-	{
-		//Two (non-overlapping) ranges
-		for (int i = idMin; i < FRAMEBUFFER; i++)
-		{
-			t_smoothed += framesTOrig[i];
-		}
-		for (int i = 0; i <= idMax; i++)
-		{
-			t_smoothed += framesTOrig[i];
-		}
-	}
-	else
-	{
-		//Single (typical) range
-		//for (int)
-		for (int i = idMin; i <= idMax; i++)
-		{
-			t_smoothed += framesTOrig[i];
-		}
-	}
-	t_smoothed /= (2 * SMOOTHING_RADIUS);
-	framesBiasLock.unlock(); //we're done, so unlock
-
-	//Find the difference between linear and smoothed versions to get a transform function for this frame
-	RigidTransform t = t_i + t_smoothed - t_linear;
-
-	//Find the accumulated dT
-	//RigidTransform transform = framesT[frame % FRAMEBUFFER];
+	//Compensate: now + (target - current)
+	RigidTransform dT = t_i + X - Z;
 
 	//Calculate transform matrix
-	Mat T = t.makeMatrix();
+	Mat T = dT.makeMatrix();
 
 	//Transform frame
 	Mat out;
 	warpAffine(mat, out, T, mat.size());
 
-	//Wait for thread write lock to release
-	while (threadWriteLock[thread])
+	//Wait until our framebuffer has an empty slot
+	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
+		wait(1);
+
+	//Copy frame to write buffer
+	frames[frame % FRAMEBUFFER] = out.clone();
+}
+
+void stabilizeFrames(const unsigned int frameCount)
+{
+	Mat tmp;
+	RigidTransform sum(0, 0, 0);
+
+	while (frameStabilizing < frameCount && running)
+	{
+		//Launch when necessary frame was analyzed
+		if (framesAnalyzed >= frameStabilizing)
+		{
+			//Get another frame from video
+			inputStabilize >> tmp;
+
+			//Write some debug info :)
+			coutLock.lock();
+			cout << "Stabilizing frame " << frameStabilizing << endl;
+			coutLock.unlock();
+
+			//Get measured input
+			sum += framesT[frameStabilizing % FRAMEBUFFER];
+
+			//Stabilize frame - run *quickly*
+			stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
+				sum, tmp);
+
+			//Prepare for another to spawn
+			frameStabilizing++;	
+		}
 		wait(5);
-
-	//Write out transformation
-	framesStabilizeOut[thread] = out;
-
-	//Prepare for another thread
-	threadWriteLock[thread] = true;			//Wait to write
-	threadStabilizeBusy[thread] = false;
+	}
 }
 
 void writeFrames(const unsigned int frameCount)
 {
 	while (frameWriting < frameCount && running)
 	{
-		for (int t = 0; t < THREADS; t++)
+		//Wait until we have a frame to write
+		if (frameStabilizing - 1 >= frameWriting)
 		{
-			//While we have the next frame to write, do it
-			if ((threadStabilizeFrame[t] == frameWriting) && (threadWriteLock[t]))
-			{
-				coutLock.lock();
-				cout << "Writing     frame " << frameWriting << endl;
-				coutLock.unlock();
-				output.write(framesStabilizeOut[t]);
-				threadWriteLock[t] = false;
-				frameWriting++;
-			}
+			coutLock.lock();
+			cout << "Writing     frame " << frameWriting << endl;
+			coutLock.unlock();
+			output << frames[frameWriting % FRAMEBUFFER];
+			frameWriting++;
 		}
 		wait(5);
 	}
@@ -323,23 +284,24 @@ void startThreads()
 	//Set initial variables
 	Mat tmp;
 	framesT[0] = RigidTransform(0, 0, 0);
-	framesTOrig[0] = RigidTransform(0, 0, 0);
-	framesTBias = RigidTransform(0, 0, 0);
+	X = RigidTransform(0, 0, 0);
+	K = RigidTransform(0, 0, 0);
+	P = RigidTransform(1, 1, 1);
 
 	//Prepare threading
 	thread analysisThreads[THREADS];
-	thread stabilizeThreads[THREADS];
 	for (size_t i = 0; i < THREADS; i++)
 	{
 		threadAnalyzeBusy[i] = false;	//clear this flag so threads can spin up
-		threadStabilizeBusy[i] = false;	//clear this flag so threads can spin up
-		threadWriteLock[i] = false;		//open write lock flag so first threadMat can be written
 	}
-	
+
 	//Write in first frame without transformation (for now)
 	inputAnalyze >> tmp;
 	output.write(tmp);
 	Mat prevFrameAnalyzed = tmp.clone();
+
+	//Start stabiliziation thread
+	thread stabThread = thread(stabilizeFrames, frameCount);
 
 	//Start frame writer
 	thread writeThread = thread(writeFrames, frameCount);
@@ -349,11 +311,11 @@ void startThreads()
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
-			//Check on ANALYSIS threads
+			//Check on analysis threads
 			//Make sure that the thread is not busy AND more frames are left to analyze AND
 			//running it won't overlap any data
 			if ((!threadAnalyzeBusy[t]) && (frameAnalyzing < frameCount) &&
-				(frameStabilizing + FRAMEBUFFER >= frameAnalyzing))
+				(frameWriting + FRAMEBUFFER - 1 > frameAnalyzing))
 			{
 				//Make sure thread is actually done
 				if (analysisThreads[t].joinable())
@@ -378,51 +340,19 @@ void startThreads()
 				tmp.copyTo(prevFrameAnalyzed);
 				frameAnalyzing++;
 			}
-
-			//Check on STABILIZE threads
-			//Make sure that the thread is not busy AND more frames are left to stabilize AND
-			//analysis has completed enough analysis to continue
-			if ((!threadStabilizeBusy[t]) && (frameStabilizing < frameCount) && 
-				//thread has no write locks on it
-				(!threadWriteLock[t]) && 
-				//either analysis is ahead enough of stabilization OR analysis reached the end
-				((framesAnalyzed >= frameStabilizing + FRAMES) || (framesAnalyzed == frameCount - 1)))
-			{
-				//Make sure thread is actually done
-				if (stabilizeThreads[t].joinable())
-					stabilizeThreads[t].join();
-
-				//Set frame vars
-				threadStabilizeFrame[t] = frameStabilizing;
-				threadStabilizeBusy[t] = true;
-
-				//Get another frame from video
-				inputStabilize >> tmp;
-
-				//Write some debug info :)
-				coutLock.lock();
-				cout << "Stabilizing frame " << frameStabilizing << " (thread " << t << ")" << endl;
-				coutLock.unlock();
-
-				//Launch thread
-				stabilizeThreads[t] = thread(stabilizeFrame, frameCount, frameStabilizing, t, tmp.clone());
-
-				//Prepare for another to spawn
-				frameStabilizing++;
-			}
 		}
 		wait(1);
 	}
 
 	//Wait for threads to terminate
+	if (stabThread.joinable())
+		stabThread.join();
 	if (writeThread.joinable())
 		writeThread.join();
 	for (size_t i = 0; i < THREADS; i++)
 	{
 		if (analysisThreads[i].joinable())
 			analysisThreads[i].join();
-		if (stabilizeThreads[i].joinable())
-			stabilizeThreads[i].join();
 	}
 
 	terminated = true;
