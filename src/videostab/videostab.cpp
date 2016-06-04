@@ -11,8 +11,8 @@
 using namespace std;
 using namespace cv;
 
-const unsigned int THREADS = 4;
-const unsigned int FRAMEBUFFER = 12;
+const unsigned int THREADS = 2;
+const unsigned int FRAMEBUFFER = 16;
 
 struct RigidTransform
 {
@@ -128,6 +128,49 @@ static void display(Mat& before, Mat& after)
 	waitKey(1);
 }
 
+static Mat fisheyeCorrection(Mat& src)
+{
+	double fx = 857.48296979;
+	double fy = 876.71824265;
+	double cx = 968.06224829;
+	double cy = 556.37145899;
+
+	double distortion[] = { -2.57614020e-1, 8.77086999e-2,
+		-2.56970803e-4, -5.93390389e-4, -1.52194091e-2 };
+	
+	//Intrinsic matrix
+	Mat intrinsics = Mat(3, 3, CV_64FC1);
+	intrinsics.setTo(0);
+	intrinsics.at<double>(0, 0) = fx;
+	intrinsics.at<double>(1, 1) = fy;
+	intrinsics.at<double>(2, 2) = 1.0;
+	intrinsics.at<double>(0, 2) = cx;
+	intrinsics.at<double>(1, 2) = cy;
+
+	//Distortion coefficients
+	Mat dist_coeffs = Mat(1, 5, CV_64FC1);
+	dist_coeffs.setTo(0);
+	dist_coeffs.at<double>(0, 0) = distortion[0];
+	dist_coeffs.at<double>(0, 1) = distortion[1];
+	dist_coeffs.at<double>(0, 2) = distortion[2];
+	dist_coeffs.at<double>(0, 3) = distortion[3];
+	dist_coeffs.at<double>(0, 4) = distortion[4];
+
+	Mat dst(src.rows, src.cols, src.type());
+	Mat mapx, mapy;
+
+	//Find optimal camera matrix (least cropping)
+	Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs, 
+		Size(src.cols, src.rows), 1, Size(), (Rect*)0, true);
+	//Prepare undistortion x and y maps
+	/*initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
+	//Perform remap (undistortion) operation
+	remap(src, dst, mapx, mapy, INTER_LINEAR);*/
+	undistort(src, dst, intrinsics, dist_coeffs);
+
+	return dst;
+}
+
 void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat, Mat& prevMat)
 {
 	const int id = frame % FRAMEBUFFER;
@@ -223,9 +266,12 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 	//Calculate transform matrix
 	Mat T = dT.makeMatrix();
 
-	//Transform frame
+	//Perform fisheye correction
+	Mat out1 = fisheyeCorrection(mat);
+
+	//Transform (stabilize) frame
 	Mat out;
-	warpAffine(mat, out, T, mat.size());
+	warpAffine(out1, out, T, mat.size());
 
 	//Wait until our framebuffer has an empty slot
 	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
@@ -242,8 +288,28 @@ void stabilizeFrames(const unsigned int frameCount)
 
 	while (frameStabilizing < frameCount && running)
 	{
+		//Check lowest frame currently in processing
+		int minFrameAnalyzing = INT_MAX;
+		bool frameDone = false;
+		bool allDone = true;
+		for (unsigned int t = 0; t < THREADS; t++)
+		{
+			if (threadAnalyzeBusy[t]) 
+				allDone = false;
+			if ((threadAnalyzeFrame[t] == frameStabilizing) &&
+				(!threadAnalyzeBusy[t]))
+			{
+				frameDone = true;
+				break;
+			}
+			if (threadAnalyzeFrame[t] < minFrameAnalyzing)
+				minFrameAnalyzing = threadAnalyzeFrame[t];
+		}
+		if (minFrameAnalyzing >= frameStabilizing + 1 || allDone)
+			frameDone = true;
+
 		//Launch when necessary frame was analyzed
-		if (framesAnalyzed >= frameStabilizing)
+		if (frameDone)
 		{
 			//Get another frame from video
 			inputStabilize >> tmp;
@@ -266,7 +332,10 @@ void stabilizeFrames(const unsigned int frameCount)
 			//Prepare for another to spawn
 			frameStabilizing++;	
 		}
-		wait(5);
+		else
+		{
+			wait(5);
+		}
 	}
 }
 
@@ -335,7 +404,7 @@ void startThreads()
 			//Make sure that the thread is not busy AND more frames are left to analyze AND
 			//running it won't overlap any data
 			if ((!threadAnalyzeBusy[t]) && (frameAnalyzing < frameCount) &&
-				(frameWriting + FRAMEBUFFER - 1 > frameAnalyzing))
+				(frameStabilizing + FRAMEBUFFER >= frameAnalyzing))
 			{
 				//Make sure thread is actually done
 				if (analysisThreads[t].joinable())
@@ -380,7 +449,9 @@ void startThreads()
 
 void handleSignal(int sig)
 {
+	coutLock.lock();
 	cout << "Signal " << sig << " caught. Exiting safely..." << endl;
+	coutLock.unlock();
 
 	//Raise exit flag
 	running = false;
