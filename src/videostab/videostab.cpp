@@ -11,8 +11,8 @@
 using namespace std;
 using namespace cv;
 
-const unsigned int THREADS = 6;
-const unsigned int FRAMEBUFFER = 16;
+const unsigned int THREADS = 4;
+const unsigned int FRAMEBUFFER = 12;
 
 struct RigidTransform
 {
@@ -109,6 +109,23 @@ RigidTransform X, P, K;							//Kalman filter global variables
 static void wait(int millis)
 {
 	this_thread::sleep_for(std::chrono::milliseconds(millis));
+}
+
+static void display(Mat& before, Mat& after)
+{
+	//Sraw the original and stablized iamges side-by-side
+	Mat canvas = Mat::zeros(before.rows, before.cols * 2 + 10, before.type());
+
+	before.copyTo(canvas(Range::all(), Range(0, before.cols)));
+	after.copyTo(canvas(Range::all(), Range(before.cols + 10, before.cols * 2 + 10)));
+
+	//Scale canvas if too big
+	if (canvas.cols > 1920) {
+		resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
+	}
+
+	imshow("Before and After", canvas);
+	waitKey(1);
 }
 
 void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat, Mat& prevMat)
@@ -242,6 +259,9 @@ void stabilizeFrames(const unsigned int frameCount)
 			//Stabilize frame - run *quickly*
 			stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
 				sum, tmp);
+
+			//Draw the image on screen
+			display(tmp, frames[frameStabilizing % FRAMEBUFFER]);
 
 			//Prepare for another to spawn
 			frameStabilizing++;	
