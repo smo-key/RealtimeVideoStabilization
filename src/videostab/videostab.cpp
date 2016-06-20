@@ -1,3 +1,5 @@
+//#define USE_CUDA
+
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <cassert>
@@ -7,6 +9,18 @@
 #include <chrono>
 #include <thread>
 #include <signal.h>
+
+#ifdef USE_CUDA
+#include "opencv2/cudalegacy.hpp"
+#include "opencv2/cudaimgproc.hpp"
+#include "opencv2/cudaarithm.hpp"
+#include "opencv2/cudawarping.hpp"
+#include "opencv2/cudafeatures2d.hpp"
+#include "opencv2/cudafilters.hpp"
+#include "opencv2/cudaoptflow.hpp"
+#include "opencv2/cudabgsegm.hpp"
+#include "opencv2/cudacodec.hpp"
+#endif
 
 using namespace std;
 using namespace cv;
@@ -106,6 +120,26 @@ RigidTransform framesT[FRAMEBUFFER];			//parsed frame transformation deltas
 Mat frames[FRAMEBUFFER];						//an actual frame buffer between stab and write threads
 RigidTransform X, P, K;							//Kalman filter global variables
 
+#ifdef USE_CUDA
+template<class T>
+static vector<T> copyGMatToVector(cuda::GpuMat& _mat)
+{
+	Mat mat;
+
+	//Copy data from GPU to CPU
+	_mat.download(mat);
+
+	//Pointer to the i-th row
+	const T* p = mat.ptr<T>(0);
+
+	//Copy data to a vector.  Note that (p + mat.cols) points to the
+	//end of the row.
+	vector<T> vec(p, p + mat.cols);
+
+	return vec;
+}
+#endif
+
 static void wait(int millis)
 {
 	this_thread::sleep_for(std::chrono::milliseconds(millis));
@@ -128,7 +162,11 @@ static void display(Mat& before, Mat& after)
 	waitKey(1);
 }
 
+#ifndef USE_CUDA
 static Mat fisheyeCorrection(Mat& src)
+#else
+static cuda::GpuMat fisheyeCorrection(cuda::GpuMat& src)
+#endif
 {
 	double fx = 857.48296979;
 	double fy = 876.71824265;
@@ -156,17 +194,27 @@ static Mat fisheyeCorrection(Mat& src)
 	dist_coeffs.at<double>(0, 3) = distortion[3];
 	dist_coeffs.at<double>(0, 4) = distortion[4];
 
+#ifndef USE_CUDA
 	Mat dst(src.rows, src.cols, src.type());
+#else
+	cuda::GpuMat dst(src.rows, src.cols, src.type());
+#endif
+
 	Mat mapx, mapy;
 
 	//Find optimal camera matrix (least cropping)
 	Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs, 
 		Size(src.cols, src.rows), 1, Size(), (Rect*)0, true);
 	//Prepare undistortion x and y maps
-	/*initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
+	initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
 	//Perform remap (undistortion) operation
-	remap(src, dst, mapx, mapy, INTER_LINEAR);*/
-	undistort(src, dst, intrinsics, dist_coeffs);
+#ifndef USE_CUDA
+	remap(src, dst, mapx, mapy, INTER_LINEAR);
+#else
+	cuda::GpuMat _mapx(mapx), _mapy(mapy);
+	cuda::remap(src, dst, _mapx, _mapy, INTER_LINEAR);
+#endif
+	//undistort(src, dst, intrinsics, dist_coeffs);
 
 	return dst;
 }
@@ -175,30 +223,63 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 {
 	const int id = frame % FRAMEBUFFER;
 
+#ifndef USE_CUDA
 	Mat grayCur, grayPrev;
+
 	cvtColor(mat, grayCur, COLOR_BGR2GRAY);
 	cvtColor(prevMat, grayPrev, COLOR_BGR2GRAY);
+#else
+	cuda::GpuMat grayCur, grayPrev, _mat(mat), _prevMat(prevMat);
+
+	cuda::cvtColor(_mat, grayCur, COLOR_BGR2GRAY);
+	cuda::cvtColor(_prevMat, grayPrev, COLOR_BGR2GRAY);
+#endif
 
 	//Keypoint vectors and status vectors
-	vector <Point2f> _keypointPrev = vector<Point2f>();
-	_keypointPrev.reserve(500);
-	vector <Point2f>_keypointCur = vector<Point2f>();
-	vector <Point2f> keypointPrev = vector<Point2f>();
-	vector <Point2f> keypointCur = vector<Point2f>();
+	vector <Point2f> _keypointPrev;
+	vector <Point2f> _keypointCur;
 
 	//Find good features
+#ifndef USE_CUDA
+	_keypointPrev = vector<Point2f>();
+	_keypointPrev.reserve(500);
+	//_keypointCur = vector<Point2f>();
 	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.0005, 3);
+#else
+	cuda::GpuMat _keypointPrevMat;
+	cuda::createGoodFeaturesToTrackDetector(grayPrev.type(), 500, 0.0005, 3)->detect(grayPrev, _keypointPrevMat);
+
+	// Copy data from _keypointPrevMat to _keypointPrev vector
+	_keypointPrev = copyGMatToVector<Point2f>(_keypointPrevMat);
+#endif
 
 	//Output
 	RigidTransform dT(0, 0, 0);
 
 	if (_keypointPrev.size() > 0)
 	{
-		vector <uchar> status = vector<uchar>();
-		vector <float> err = vector<float>();
+		vector <uchar> status;
+		vector <float> err;
 
 		//Calculate optical flow
+#ifndef USE_CUDA
 		calcOpticalFlowPyrLK(grayPrev, grayCur, _keypointPrev, _keypointCur, status, err);
+#else
+		cuda::GpuMat _status, _err, _keypointCurMat;
+		cuda::SparsePyrLKOpticalFlow::create()->calc(grayPrev, grayCur, _keypointPrevMat, _keypointCurMat, _status, _err);
+
+		status = copyGMatToVector<uchar>(_status);
+		err = copyGMatToVector<float>(_err);
+
+		_keypointCur = copyGMatToVector<Point2f>(_keypointCurMat);
+		_status.release();
+		_err.release();
+		_keypointCurMat.release();
+		_keypointPrevMat.release();
+#endif
+
+		vector <Point2f> keypointPrev = vector<Point2f>();
+		vector <Point2f> keypointCur = vector<Point2f>();
 
 		//Remove bad matches
 		for (size_t i = 0; i < status.size(); i++)
@@ -210,8 +291,10 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 			}
 		}
 
+		Mat kP(keypointPrev), kC(keypointCur);
+
 		//Estimate transformation with translation and rotation only
-		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false);
+		Mat matT = estimateRigidTransform(kP, kC, false);
 		
 		//Sometimes, no transformation could be found
 		if ((matT.rows == 2) && (matT.cols == 3))
@@ -266,19 +349,36 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 	//Calculate transform matrix
 	Mat T = dT.makeMatrix();
 
+#ifndef USE_CUDA
 	//Perform fisheye correction
 	Mat out1 = fisheyeCorrection(mat);
 
 	//Transform (stabilize) frame
 	Mat out;
 	warpAffine(out1, out, T, mat.size());
+#else
+	//Perform fisheye correction
+	cuda::GpuMat cudaMat(mat);
+	cuda::GpuMat out1 = fisheyeCorrection(cudaMat);
+
+	//Transform (stabilize) frame
+	cuda::GpuMat out;
+	cuda::warpAffine(out1, out, T, cudaMat.size());
+#endif
 
 	//Wait until our framebuffer has an empty slot
 	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
 		wait(1);
 
 	//Copy frame to write buffer
+#ifndef USE_CUDA
 	frames[frame % FRAMEBUFFER] = out.clone();
+#else
+	Mat _out(out);
+	frames[frame % FRAMEBUFFER] = _out.clone();
+	out.release();
+	out1.release();
+#endif
 }
 
 void stabilizeFrames(const unsigned int frameCount)
@@ -352,6 +452,7 @@ void writeFrames(const unsigned int frameCount)
 			output << frames[frameWriting % FRAMEBUFFER];
 			frameWriting++;
 		}
+
 		wait(5);
 	}
 }
@@ -400,6 +501,7 @@ void startThreads()
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
+
 			//Check on analysis threads
 			//Make sure that the thread is not busy AND more frames are left to analyze AND
 			//running it won't overlap any data
@@ -497,7 +599,7 @@ int main(int argc, char** argv)
 
 	//Prepare output video stream
 	output = VideoWriter(argv[2],
-		inputAnalyze.get(CV_CAP_PROP_FOURCC),
+		VideoWriter::fourcc('X','2','6','4'),
 		inputAnalyze.get(CV_CAP_PROP_FPS),
 		Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
 			inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT)));
