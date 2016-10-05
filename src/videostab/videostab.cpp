@@ -6,13 +6,16 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <signal.h>
 
 using namespace std;
 using namespace cv;
 
 const unsigned int THREADS = 2;
-const unsigned int FRAMEBUFFER = 16;
+const unsigned int FRAMEBUFFER = 6;
+
+#define VERBOSE
 
 struct RigidTransform
 {
@@ -68,23 +71,25 @@ public:
 		//Particularly, an affine transformation matrix
 		Mat T(2, 3, CV_64F);
 
+		double _angle = min(max(angle,-CV_PI/200.0), CV_PI/200.0);
+
 		T.at<double>(0, 0) = cos(angle);
 		T.at<double>(0, 1) = -sin(angle);
 		T.at<double>(1, 0) = sin(angle);
 		T.at<double>(1, 1) = cos(angle);
 
-		T.at<double>(0, 2) = x;
-		T.at<double>(1, 2) = y;
+		T.at<double>(0, 2) = min(max(x,-50.0), 50.0); //x
+		T.at<double>(1, 2) = min(max(y,-50.0), 50.0); //y
 
 		return T;
 	}
 };
 
 //Kalman filter constants
-const double Q_val = 4e-3; //4e-3
-const double R_val = 0.25; //0.25
+const double Q_val = 4e-3; //4e-3 4e-2
+const double R_val = 0.25; //0.25 5
 RigidTransform Q(Q_val, Q_val, Q_val); // process noise covariance
-RigidTransform R(R_val, R_val, R_val); // measurement noise covariance 
+RigidTransform R(R_val, R_val, R_val); // measurement noise covariance
 
 //Video I/O
 VideoCapture inputAnalyze;
@@ -137,7 +142,7 @@ static Mat fisheyeCorrection(Mat& src)
 
 	double distortion[] = { -2.57614020e-1, 8.77086999e-2,
 		-2.56970803e-4, -5.93390389e-4, -1.52194091e-2 };
-	
+
 	//Intrinsic matrix
 	Mat intrinsics = Mat(3, 3, CV_64FC1);
 	intrinsics.setTo(0);
@@ -160,12 +165,12 @@ static Mat fisheyeCorrection(Mat& src)
 	Mat mapx, mapy;
 
 	//Find optimal camera matrix (least cropping)
-	Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs, 
-		Size(src.cols, src.rows), 1, Size(), (Rect*)0, true);
+	// Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs,
+		// Size(src.cols, src.rows), 1, Size(), (Rect*)0, true);
 	//Prepare undistortion x and y maps
-	/*initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
+	// initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
 	//Perform remap (undistortion) operation
-	remap(src, dst, mapx, mapy, INTER_LINEAR);*/
+	// remap(src, dst, mapx, mapy, INTER_CUBIC);
 	undistort(src, dst, intrinsics, dist_coeffs);
 
 	return dst;
@@ -186,8 +191,14 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 	vector <Point2f> keypointPrev = vector<Point2f>();
 	vector <Point2f> keypointCur = vector<Point2f>();
 
+	Mat dst;
+	Ptr<CLAHE> clahe = createCLAHE();
+	clahe->setClipLimit(4); //greater clip limit = more contrast
+	clahe->apply(grayCur,grayCur);
+	clahe->apply(grayPrev,grayPrev);
+
 	//Find good features
-	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.0005, 3);
+	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.05, 2);
 
 	//Output
 	RigidTransform dT(0, 0, 0);
@@ -212,7 +223,7 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 
 		//Estimate transformation with translation and rotation only
 		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false);
-		
+
 		//Sometimes, no transformation could be found
 		if ((matT.rows == 2) && (matT.cols == 3))
 		{
@@ -257,7 +268,7 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 
 	//Measurement correction
 	K = P_ / (P_ + R);						//K(k) = P_(k)/( P_(k)+R );
-	X = X_ + K*(Z - X_);					//z-X_ is residual, X(k) = X_(k)+K(k)*(z(k)-X_(k)); 
+	X = X_ + K*(Z - X_);					//z-X_ is residual, X(k) = X_(k)+K(k)*(z(k)-X_(k));
 	P = (RigidTransform(1, 1, 1) - K)*P_;	//P(k) = (1-K(k))*P_(k);
 
 	//Compensate: now + (target - current)
@@ -266,12 +277,11 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 	//Calculate transform matrix
 	Mat T = dT.makeMatrix();
 
-	//Perform fisheye correction
-	Mat out1 = fisheyeCorrection(mat);
-
 	//Transform (stabilize) frame
 	Mat out;
-	warpAffine(out1, out, T, mat.size());
+	warpAffine(mat, out, T, mat.size());
+	//Perform fisheye correction
+	out = fisheyeCorrection(out);
 
 	//Wait until our framebuffer has an empty slot
 	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
@@ -294,7 +304,7 @@ void stabilizeFrames(const unsigned int frameCount)
 		bool allDone = true;
 		for (unsigned int t = 0; t < THREADS; t++)
 		{
-			if (threadAnalyzeBusy[t]) 
+			if (threadAnalyzeBusy[t])
 				allDone = false;
 			if ((threadAnalyzeFrame[t] == frameStabilizing) &&
 				(!threadAnalyzeBusy[t]))
@@ -330,7 +340,7 @@ void stabilizeFrames(const unsigned int frameCount)
 			display(tmp, frames[frameStabilizing % FRAMEBUFFER]);
 
 			//Prepare for another to spawn
-			frameStabilizing++;	
+			frameStabilizing++;
 		}
 		else
 		{
@@ -388,6 +398,7 @@ void startThreads()
 	inputAnalyze >> tmp;
 	output.write(tmp);
 	Mat prevFrameAnalyzed = tmp.clone();
+	Mat t1, t2;
 
 	//Start stabiliziation thread
 	thread stabThread = thread(stabilizeFrames, frameCount);
@@ -396,7 +407,7 @@ void startThreads()
 	thread writeThread = thread(writeFrames, frameCount);
 
 	//Run all threads until everything is written
-	while (frameStabilizing < frameCount && running)
+	while ((frameStabilizing < frameCount) && running)
 	{
 		for (int t = 0; t < THREADS; t++)
 		{
@@ -423,7 +434,10 @@ void startThreads()
 				coutLock.unlock();
 
 				//Spawn new analysis thread
-				analysisThreads[t] = thread(analyzeFrame, frameAnalyzing, t, tmp.clone(), prevFrameAnalyzed.clone());
+				t1 = tmp.clone();
+				t2 = prevFrameAnalyzed.clone();
+
+				analysisThreads[t] = thread(analyzeFrame, frameAnalyzing, t, std::ref(t1), std::ref(t2));
 
 				//Prepare for another to spawn
 				tmp.copyTo(prevFrameAnalyzed);
@@ -432,6 +446,8 @@ void startThreads()
 		}
 		wait(1);
 	}
+
+	cout << "Waiting for threads..." << endl;
 
 	//Wait for threads to terminate
 	if (stabThread.joinable())
@@ -443,6 +459,8 @@ void startThreads()
 		if (analysisThreads[i].joinable())
 			analysisThreads[i].join();
 	}
+
+	cout << "Terminated!" << endl;
 
 	terminated = true;
 }
@@ -457,8 +475,10 @@ void handleSignal(int sig)
 	running = false;
 
 	//Wait for threads to terminate
-	while (!terminated)
-		wait(50);
+	// while (!terminated)
+	// 	wait(50);
+
+	cout << "All threads closed!" << endl;
 
 	//Close streams
 	output.release();
@@ -474,13 +494,13 @@ int main(int argc, char** argv)
 	if (argc < 3)
 	{
 		cout << "./videostab (options) (data.csv) [input.mp4] [output.mp4]" << endl;
-		cout << endl;
-		cout << "TRANSFORM OPTIONS" << endl;
-		cout << "-S (-prsh)  Similarity Transform (Position, Rotation, Scale, sHear)" << endl;
-		cout << endl;
-		cout << "RENDERING OPTIONS" << endl;
-		cout << "-G          Use GPU (default=no)" << endl;
-		cout << "-Tn         Use n threads (default=4)" << endl;
+		// cout << endl;
+		// cout << "TRANSFORM OPTIONS" << endl;
+		// cout << "-S (-prsh)  Similarity Transform (Position, Rotation, Scale, sHear)" << endl;
+		// cout << endl;
+		// cout << "RENDERING OPTIONS" << endl;
+		// cout << "-G          Use GPU (default=no)" << endl;
+		// cout << "-Tn         Use n threads (default=4)" << endl;
 	}
 
 	//Catch escape signals

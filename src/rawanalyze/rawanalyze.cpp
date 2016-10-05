@@ -11,6 +11,7 @@
 #include <fstream>
 #include <vector>
 #include <sys/stat.h>
+#include <string.h>
 
 using namespace std;
 
@@ -223,6 +224,8 @@ int main(int argc, char **argv)
 		//Split the line into columns
 		file.getline(line, LINE_BUFFER);
 		int col = 0;
+
+		//Split the line into commas
 		item = strtok(line, ",");
 		data[0] = item;
 		while (item != NULL && (col < 12))
