@@ -475,8 +475,10 @@ void handleSignal(int sig)
 	running = false;
 
 	//Wait for threads to terminate
-	// while (!terminated)
-	// 	wait(50);
+	#if defined(WIN32) || defined(_WIN32) || defined(__WIN32) && !defined(__CYGWIN__)
+	while (!terminated)
+	 	wait(50);
+	#endif
 
 	cout << "All threads closed!" << endl;
 
