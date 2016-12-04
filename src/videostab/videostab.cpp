@@ -12,8 +12,8 @@
 using namespace std;
 using namespace cv;
 
-const unsigned int THREADS = 2;
-const unsigned int FRAMEBUFFER = 6;
+const unsigned int THREADS = 4;
+const unsigned int FRAMEBUFFER = 8;
 
 #define VERBOSE
 
@@ -86,8 +86,8 @@ public:
 };
 
 //Kalman filter constants
-const double Q_val = 4e-3; //4e-3 4e-2
-const double R_val = 0.25; //0.25 5
+const double Q_val = -1.04485; //4e-3 4e-2
+const double R_val = -1.04485; //0.25 5
 RigidTransform Q(Q_val, Q_val, Q_val); // process noise covariance
 RigidTransform R(R_val, R_val, R_val); // measurement noise covariance
 
@@ -171,9 +171,9 @@ static Mat fisheyeCorrection(Mat& src)
 	// initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
 	//Perform remap (undistortion) operation
 	// remap(src, dst, mapx, mapy, INTER_CUBIC);
-	undistort(src, dst, intrinsics, dist_coeffs);
+	//undistort(src, dst, intrinsics, dist_coeffs);
 
-	return dst;
+	return src;
 }
 
 void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat, Mat& prevMat)
@@ -231,6 +231,7 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 			double dx = matT.at<double>(0, 2);
 			double dy = matT.at<double>(1, 2);
 			double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
+			//double dr = 
 			dT = RigidTransform(dx, dy, da);
 		}
 	}
