@@ -3,17 +3,91 @@
 #include <cassert>
 #include <cmath>
 #include <fstream>
+#include <sstream>
 #include <mutex>
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <iomanip>
 #include <signal.h>
 
 using namespace std;
-using namespace cv;
 
-const unsigned int THREADS = 4;
-const unsigned int FRAMEBUFFER = 8;
+template <typename T>
+std::string to_string_with_precision(const T value, const int n = 4)
+{
+	std::ostringstream out;
+	out << std::setprecision(n) << value;
+	return out.str();
+}
+
+#include <sys/timeb.h>
+#if defined(_MSC_VER) || defined(WIN32)  || defined(_WIN32) || defined(__WIN32__) \
+    || defined(WIN64)    || defined(_WIN64) || defined(__WIN64__) 
+
+#include <windows.h>
+bool _qpcInited = false;
+double PCFreq = 0.0;
+__int64 CounterStart = 0;
+void InitCounter()
+{
+	LARGE_INTEGER li;
+	if (!QueryPerformanceFrequency(&li))
+	{
+		std::cout << "QueryPerformanceFrequency failed!\n";
+	}
+	PCFreq = double(li.QuadPart) / 1000.0f;
+	_qpcInited = true;
+}
+double CLOCK()
+{
+	if (!_qpcInited) InitCounter();
+	LARGE_INTEGER li;
+	QueryPerformanceCounter(&li);
+	return double(li.QuadPart) / PCFreq;
+}
+
+#endif
+
+#if defined(unix)        || defined(__unix)      || defined(__unix__) \
+    || defined(linux)       || defined(__linux)     || defined(__linux__) \
+    || defined(sun)         || defined(__sun) \
+    || defined(BSD)         || defined(__OpenBSD__) || defined(__NetBSD__) \
+    || defined(__FreeBSD__) || defined __DragonFly__ \
+    || defined(sgi)         || defined(__sgi) \
+    || defined(__MACOSX__)  || defined(__APPLE__) \
+    || defined(__CYGWIN__) 
+double CLOCK()
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (t.tv_sec * 1000) + (t.tv_nsec*1e-6);
+}
+#endif
+
+double _avgdur = 0;
+double _fpsstart = 0;
+double _avgfps = 0;
+double _fps1sec = 0;
+
+double avgdur(double newdur)
+{
+	_avgdur = 0.98*_avgdur + 0.02*newdur;
+	return _avgdur;
+}
+
+double avgfps()
+{
+	if (CLOCK() - _fpsstart>1000)
+	{
+		_fpsstart = CLOCK();
+		_avgfps = 0.7*_avgfps + 0.3*_fps1sec;
+		_fps1sec = 0;
+	}
+	_fps1sec++;
+	return _avgfps;
+}
+
 
 #define VERBOSE
 
@@ -66,35 +140,56 @@ public:
 		return RigidTransform(c1.x / c2.x, c1.y / c2.y, c1.angle / c2.angle);
 	}
 
-	Mat makeMatrix()
+	cv::Mat makeMatrix()
 	{
 		//Particularly, an affine transformation matrix
-		Mat T(2, 3, CV_64F);
+		cv::Mat T(2, 3, CV_64F);
 
-		double _angle = min(max(angle,-CV_PI/200.0), CV_PI/200.0);
+		//double _angle = min(max(angle,-CV_PI/45.0), CV_PI/45.0);
 
 		T.at<double>(0, 0) = cos(angle);
 		T.at<double>(0, 1) = -sin(angle);
 		T.at<double>(1, 0) = sin(angle);
 		T.at<double>(1, 1) = cos(angle);
 
-		T.at<double>(0, 2) = min(max(x,-50.0), 50.0); //x
-		T.at<double>(1, 2) = min(max(y,-50.0), 50.0); //y
+		T.at<double>(0, 2) = x; //x
+		T.at<double>(1, 2) = y; //y
 
 		return T;
 	}
 };
 
+struct AnalysisResults 
+{
+public:
+	vector <cv::Point2f> keypointPrev;
+	vector <cv::Point2f> keypointCur;
+
+	AnalysisResults() 
+	{
+		keypointPrev = vector<cv::Point2f>();
+		keypointCur = vector<cv::Point2f>();
+	}
+	AnalysisResults(vector<cv::Point2f> keypointPrev, vector<cv::Point2f> keypointCur)
+	{
+		this->keypointPrev = keypointPrev;
+		this->keypointCur = keypointCur;
+	}
+};
+
+const unsigned int THREADS = 4;
+const unsigned int FRAMEBUFFER = 8;
+
 //Kalman filter constants
-const double Q_val = -1.04485; //4e-3 4e-2
-const double R_val = -1.04485; //0.25 5
+const double Q_val = 4e-3; //4e-3 4e-2
+const double R_val = 0.25; //0.25 5
 RigidTransform Q(Q_val, Q_val, Q_val); // process noise covariance
 RigidTransform R(R_val, R_val, R_val); // measurement noise covariance
 
 //Video I/O
-VideoCapture inputAnalyze;
-VideoCapture inputStabilize;
-VideoWriter output;
+cv::VideoCapture inputAnalyze;
+cv::VideoCapture inputStabilize;
+cv::VideoWriter output;
 mutex coutLock;
 
 //Threading
@@ -108,32 +203,48 @@ bool running = true;						//when false, begin termination
 bool terminated = false;					//when true, all threads are done
 
 RigidTransform framesT[FRAMEBUFFER];			//parsed frame transformation deltas
-Mat frames[FRAMEBUFFER];						//an actual frame buffer between stab and write threads
+AnalysisResults dataT[FRAMEBUFFER];				//parsed analysis results
+cv::Mat frames[FRAMEBUFFER];						//an actual frame buffer between stab and write threads
 RigidTransform X, P, K;							//Kalman filter global variables
 
-static void wait(int millis)
+static void wait(int micros)
 {
-	this_thread::sleep_for(std::chrono::milliseconds(millis));
+	this_thread::sleep_for(std::chrono::microseconds(micros));
 }
 
-static void display(Mat& before, Mat& after)
+void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis)
 {
-	//Sraw the original and stablized iamges side-by-side
-	Mat canvas = Mat::zeros(before.rows, before.cols * 2 + 10, before.type());
+	//Draw some neat debug info
+	for (size_t i = 0; i < analysis.keypointPrev.size(); i++)
+	{
+		line(before, analysis.keypointPrev[i], analysis.keypointCur[i], CV_RGB(0, 255, 0), 2);
+		ellipse(before, cv::RotatedRect(analysis.keypointPrev[i], cv::Size2f(5, 5), 0), CV_RGB(255, 255, 0));
+	}
 
-	before.copyTo(canvas(Range::all(), Range(0, before.cols)));
-	after.copyTo(canvas(Range::all(), Range(before.cols + 10, before.cols * 2 + 10)));
+	//Draw the original and stablized iamges side-by-side
+	cv::Mat canvas = cv::Mat::zeros(before.rows, before.cols * 2 + 10, before.type());
+
+	before.copyTo(canvas(cv::Range::all(), cv::Range(0, before.cols)));
+	after.copyTo(canvas(cv::Range::all(), cv::Range(before.cols + 10, before.cols * 2 + 10)));
+
+	//Help info
+	cv::putText(canvas, cv::String("Before"), cv::Point(8, 48), cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
+	cv::putText(canvas, cv::String("After"), cv::Point(8 + (canvas.cols / 2), 48), cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
 
 	//Scale canvas if too big
 	if (canvas.cols > 1920) {
-		resize(canvas, canvas, Size(canvas.cols / 2, canvas.rows / 2));
+		resize(canvas, canvas, cv::Size(canvas.cols / 2, canvas.rows / 2));
 	}
 
-	imshow("Before and After", canvas);
-	waitKey(1);
+	//Recalculate fps
+	cv::putText(canvas, cv::String(to_string_with_precision(avgfps())) + cv::String(" FPS"), cv::Point(8, canvas.rows - 8),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
+
+	cv::imshow("Video stabilization demonstration", canvas);
+	cv::waitKey(1);
 }
 
-static Mat fisheyeCorrection(Mat& src)
+static cv::Mat fisheyeCorrection(cv::Mat& src)
 {
 	double fx = 857.48296979;
 	double fy = 876.71824265;
@@ -144,7 +255,7 @@ static Mat fisheyeCorrection(Mat& src)
 		-2.56970803e-4, -5.93390389e-4, -1.52194091e-2 };
 
 	//Intrinsic matrix
-	Mat intrinsics = Mat(3, 3, CV_64FC1);
+	cv::Mat intrinsics = cv::Mat(3, 3, CV_64FC1);
 	intrinsics.setTo(0);
 	intrinsics.at<double>(0, 0) = fx;
 	intrinsics.at<double>(1, 1) = fy;
@@ -153,7 +264,7 @@ static Mat fisheyeCorrection(Mat& src)
 	intrinsics.at<double>(1, 2) = cy;
 
 	//Distortion coefficients
-	Mat dist_coeffs = Mat(1, 5, CV_64FC1);
+	cv::Mat dist_coeffs = cv::Mat(1, 5, CV_64FC1);
 	dist_coeffs.setTo(0);
 	dist_coeffs.at<double>(0, 0) = distortion[0];
 	dist_coeffs.at<double>(0, 1) = distortion[1];
@@ -161,47 +272,48 @@ static Mat fisheyeCorrection(Mat& src)
 	dist_coeffs.at<double>(0, 3) = distortion[3];
 	dist_coeffs.at<double>(0, 4) = distortion[4];
 
-	Mat dst(src.rows, src.cols, src.type());
-	Mat mapx, mapy;
+	cv::Mat dst(src.rows, src.cols, src.type());
+	cv::Mat mapx, mapy;
 
 	//Find optimal camera matrix (least cropping)
-	// Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs,
-		// Size(src.cols, src.rows), 1, Size(), (Rect*)0, true);
+	cv::Mat cam = getOptimalNewCameraMatrix(intrinsics, dist_coeffs,
+		 cv::Size(src.cols, src.rows), 1, cv::Size(), (cv::Rect*)0, true);
 	//Prepare undistortion x and y maps
-	// initUndistortRectifyMap(intrinsics, dist_coeffs, Mat(), cam, Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
+	initUndistortRectifyMap(intrinsics, dist_coeffs, cv::Mat(), cam, cv::Size(src.cols, src.rows), CV_32FC1, mapx, mapy);
 	//Perform remap (undistortion) operation
-	// remap(src, dst, mapx, mapy, INTER_CUBIC);
-	//undistort(src, dst, intrinsics, dist_coeffs);
+	remap(src, dst, mapx, mapy, cv::INTER_CUBIC);
+	undistort(src, dst, intrinsics, dist_coeffs);
 
 	return src;
 }
 
-void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat, Mat& prevMat)
+void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& mat, cv::Mat& prevMat) noexcept
 {
 	const int id = frame % FRAMEBUFFER;
 
-	Mat grayCur, grayPrev;
-	cvtColor(mat, grayCur, COLOR_BGR2GRAY);
-	cvtColor(prevMat, grayPrev, COLOR_BGR2GRAY);
+	cv::Mat grayCur, grayPrev;
+	cv::cvtColor(mat, grayCur, cv::COLOR_BGR2GRAY);
+	cv::cvtColor(prevMat, grayPrev, cv::COLOR_BGR2GRAY);
 
 	//Keypoint vectors and status vectors
-	vector <Point2f> _keypointPrev = vector<Point2f>();
+	vector <cv::Point2f> _keypointPrev = vector<cv::Point2f>();
 	_keypointPrev.reserve(500);
-	vector <Point2f>_keypointCur = vector<Point2f>();
-	vector <Point2f> keypointPrev = vector<Point2f>();
-	vector <Point2f> keypointCur = vector<Point2f>();
+	vector <cv::Point2f>_keypointCur = vector<cv::Point2f>();
+	vector <cv::Point2f> keypointPrev = vector<cv::Point2f>();
+	vector <cv::Point2f> keypointCur = vector<cv::Point2f>();
 
-	Mat dst;
-	Ptr<CLAHE> clahe = createCLAHE();
-	clahe->setClipLimit(4); //greater clip limit = more contrast
+	cv::Mat dst;
+	cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
+	clahe->setClipLimit(16); //greater clip limit = more contrast
 	clahe->apply(grayCur,grayCur);
 	clahe->apply(grayPrev,grayPrev);
 
 	//Find good features
-	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.05, 2);
+	goodFeaturesToTrack(grayPrev, _keypointPrev, 500, 0.01, 5);
 
 	//Output
 	RigidTransform dT(0, 0, 0);
+	AnalysisResults results = AnalysisResults();
 
 	if (_keypointPrev.size() > 0)
 	{
@@ -221,27 +333,55 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, Mat& mat,
 			}
 		}
 
-		//Estimate transformation with translation and rotation only
-		Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false);
-
-		//Sometimes, no transformation could be found
-		if ((matT.rows == 2) && (matT.cols == 3))
+		try
 		{
-			//Decompose transformation matrix
-			double dx = matT.at<double>(0, 2);
-			double dy = matT.at<double>(1, 2);
-			double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
-			//double dr = 
-			dT = RigidTransform(dx, dy, da);
+			//Estimate transformation with translation and rotation only
+			cv::Mat matT = estimateRigidTransform(keypointPrev, keypointCur, false);
+			results.keypointPrev = keypointPrev;
+			results.keypointCur = keypointCur;
+
+			//Sometimes, no transformation could be found
+			if ((matT.rows == 2) && (matT.cols == 3))
+			{
+				//Decompose transformation matrix
+				double dx = matT.at<double>(0, 2);
+				double dy = matT.at<double>(1, 2);
+				double da = atan2(matT.at<double>(1, 0), matT.at<double>(0, 0));
+				dT = RigidTransform(dx, dy, da);
+			}
+		}
+		catch (const std::exception&)
+		{
+				
 		}
 	}
 
 	//Finalize output
 	framesT[id] = dT;
+	dataT[id] = results;
 
 	//Prepare for another thread
 	framesAnalyzed++;
 	threadAnalyzeBusy[thread] = false;
+}
+
+//Kalman filter
+cv::KalmanFilter filter;
+//transition state matrix A
+const float A[] = { 1, 1, 0, 1 };
+
+void initKalman() 
+{
+	//Create Kalman filter
+	filter = cv::KalmanFilter(3, 1, 0, CV_32F);
+	//process noise covariance
+	cv::setIdentity(filter.processNoiseCov, cv::Scalar(Q_val));
+	//measurement noise covariance
+	cv::setIdentity(filter.measurementNoiseCov, cv::Scalar(R_val));
+	//a posteriori error covariance matrix
+	cv::setIdentity(filter.errorCovPost, cv::Scalar(1));
+	//initialize measurement matrix
+	cv::setIdentity(filter.measurementMatrix, cv::Scalar(1.0));
 }
 
 /*
@@ -251,10 +391,20 @@ This method is guaranteed to run in series (i.e. all frames in order, and one at
 As such, this method should run as quickly as possible. Offload any processing possible
 to analyzeFrame();
 */
-void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, Mat& mat)
+void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, cv::Mat& mat)
 {
 	//Kalman filter local variables
 	RigidTransform P_, X_;
+	//t_i = instantaneous difference
+	//Z = overall sum
+
+	//Predict (a priori)
+	cv::Mat prediction = filter.predict();
+	cout << prediction;
+
+	//Update (a posteriori)
+	cv::Mat data = filter.correct(t_i.makeMatrix());
+	cout << data;
 
 	//X		= posteriori state estimate (i.e. result of calculation)
 	//X_	= priori state estimate
@@ -276,13 +426,13 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 	RigidTransform dT = t_i + X - Z;
 
 	//Calculate transform matrix
-	Mat T = dT.makeMatrix();
+	cv::Mat T = dT.makeMatrix();
 
 	//Transform (stabilize) frame
-	Mat out;
-	warpAffine(mat, out, T, mat.size());
+	cv::Mat out;
+	cv::warpAffine(mat, out, T, mat.size());
 	//Perform fisheye correction
-	out = fisheyeCorrection(out);
+	//out = fisheyeCorrection(out);
 
 	//Wait until our framebuffer has an empty slot
 	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
@@ -294,7 +444,7 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 
 void stabilizeFrames(const unsigned int frameCount)
 {
-	Mat tmp;
+	cv::Mat tmp;
 	RigidTransform sum(0, 0, 0);
 
 	while (frameStabilizing < frameCount && running)
@@ -338,14 +488,14 @@ void stabilizeFrames(const unsigned int frameCount)
 				sum, tmp);
 
 			//Draw the image on screen
-			display(tmp, frames[frameStabilizing % FRAMEBUFFER]);
+			display(tmp, frames[frameStabilizing % FRAMEBUFFER], dataT[frameStabilizing % FRAMEBUFFER]);
 
 			//Prepare for another to spawn
 			frameStabilizing++;
 		}
 		else
 		{
-			wait(5);
+			wait(1);
 		}
 	}
 }
@@ -363,7 +513,7 @@ void writeFrames(const unsigned int frameCount)
 			output << frames[frameWriting % FRAMEBUFFER];
 			frameWriting++;
 		}
-		wait(5);
+		wait(1);
 	}
 }
 
@@ -382,11 +532,12 @@ void startThreads()
 	frameWriting = 1;								//we write the first frame early
 
 	//Set initial variables
-	Mat tmp;
+	cv::Mat tmp;
 	framesT[0] = RigidTransform(0, 0, 0);
 	X = RigidTransform(0, 0, 0);
 	K = RigidTransform(0, 0, 0);
 	P = RigidTransform(1, 1, 1);
+	initKalman();
 
 	//Prepare threading
 	thread analysisThreads[THREADS];
@@ -398,8 +549,8 @@ void startThreads()
 	//Write in first frame without transformation (for now)
 	inputAnalyze >> tmp;
 	output.write(tmp);
-	Mat prevFrameAnalyzed = tmp.clone();
-	Mat t1, t2;
+	cv::Mat prevFrameAnalyzed = tmp.clone();
+	cv::Mat t1, t2;
 
 	//Start stabiliziation thread
 	thread stabThread = thread(stabilizeFrames, frameCount);
@@ -443,6 +594,8 @@ void startThreads()
 				//Prepare for another to spawn
 				tmp.copyTo(prevFrameAnalyzed);
 				frameAnalyzing++;
+
+				break;
 			}
 		}
 		wait(1);
@@ -478,7 +631,7 @@ void handleSignal(int sig)
 	//Wait for threads to terminate
 	#if defined(WIN32) || defined(_WIN32) || defined(__WIN32) && !defined(__CYGWIN__)
 	while (!terminated)
-	 	wait(50);
+	 	wait(5000);
 	#endif
 
 	cout << "All threads closed!" << endl;
@@ -512,17 +665,17 @@ int main(int argc, char** argv)
 	signal(SIGINT, &handleSignal);
 
 	//Prepare input video streams
-	inputAnalyze = VideoCapture(argv[1]);
+	inputAnalyze = cv::VideoCapture(argv[1]);
 	assert(inputAnalyze.isOpened());
 
-	inputStabilize = VideoCapture(argv[1]);
+	inputStabilize = cv::VideoCapture(argv[1]);
 	assert(inputStabilize.isOpened());
 
 	//Prepare output video stream
-	output = VideoWriter(argv[2],
-		inputAnalyze.get(CV_CAP_PROP_FOURCC),
+	output = cv::VideoWriter(argv[2],
+		CV_FOURCC('D', 'I', 'V', 'X'),
 		inputAnalyze.get(CV_CAP_PROP_FPS),
-		Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
+		cv::Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
 			inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT)));
 	assert(output.isOpened());
 
