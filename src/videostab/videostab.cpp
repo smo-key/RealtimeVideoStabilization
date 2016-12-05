@@ -11,6 +11,35 @@
 #include <iomanip>
 #include <signal.h>
 
+char* getCmdOption(char ** begin, char ** end, const std::string & option)
+{
+	char ** itr = std::find(begin, end, option);
+	if (itr != end && ++itr != end)
+	{
+		return *itr;
+	}
+	return 0;
+}
+
+bool cmdOptionExists(char** begin, char** end, const std::string& option)
+{
+	return std::find(begin, end, option) != end;
+}
+
+#if defined(_MSC_VER) || defined(WIN32)  || defined(_WIN32) || defined(__WIN32__) \
+    || defined(WIN64)    || defined(_WIN64) || defined(__WIN64__) 
+#define WINDOWS
+#elif defined(unix)        || defined(__unix)      || defined(__unix__) \
+    || defined(linux)       || defined(__linux)     || defined(__linux__) \
+    || defined(sun)         || defined(__sun) \
+    || defined(BSD)         || defined(__OpenBSD__) || defined(__NetBSD__) \
+    || defined(__FreeBSD__) || defined __DragonFly__ \
+    || defined(sgi)         || defined(__sgi) \
+    || defined(__MACOSX__)  || defined(__APPLE__) \
+    || defined(__CYGWIN__) 
+#define UNIX
+#endif
+
 using namespace std;
 
 template <typename T>
@@ -22,9 +51,7 @@ std::string to_string_with_precision(const T value, const int n = 4)
 }
 
 #include <sys/timeb.h>
-#if defined(_MSC_VER) || defined(WIN32)  || defined(_WIN32) || defined(__WIN32__) \
-    || defined(WIN64)    || defined(_WIN64) || defined(__WIN64__) 
-
+#if defined(WINDOWS)
 #include <windows.h>
 bool _qpcInited = false;
 double PCFreq = 0.0;
@@ -47,16 +74,11 @@ double CLOCK()
 	return double(li.QuadPart) / PCFreq;
 }
 
-#endif
-
-#if defined(unix)        || defined(__unix)      || defined(__unix__) \
-    || defined(linux)       || defined(__linux)     || defined(__linux__) \
-    || defined(sun)         || defined(__sun) \
-    || defined(BSD)         || defined(__OpenBSD__) || defined(__NetBSD__) \
-    || defined(__FreeBSD__) || defined __DragonFly__ \
-    || defined(sgi)         || defined(__sgi) \
-    || defined(__MACOSX__)  || defined(__APPLE__) \
-    || defined(__CYGWIN__) 
+cv::Size GetDesktopResolution()
+{
+	return cv::Size(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+}
+#elif defined(UNIX)
 double CLOCK()
 {
 	struct timespec t;
@@ -139,8 +161,11 @@ public:
 	friend RigidTransform operator/(const RigidTransform &c1, const RigidTransform  &c2) {
 		return RigidTransform(c1.x / c2.x, c1.y / c2.y, c1.angle / c2.angle);
 	}
+	double norm() {
+		return sqrt(x*x + y*y + angle*angle);
+	}
 
-	cv::Mat makeMatrix()
+	cv::Mat makeTransformationMatrix()
 	{
 		//Particularly, an affine transformation matrix
 		cv::Mat T(2, 3, CV_64F);
@@ -155,6 +180,15 @@ public:
 		T.at<double>(0, 2) = x; //x
 		T.at<double>(1, 2) = y; //y
 
+		return T;
+	}
+
+	cv::Mat makeVector()
+	{
+		cv::Mat T = cv::Mat(3, 1, CV_32FC1);
+		T.at<float>(0, 0) = x;
+		T.at<float>(1, 0) = y;
+		T.at<float>(2, 0) = angle;
 		return T;
 	}
 };
@@ -177,12 +211,13 @@ public:
 	}
 };
 
-const unsigned int THREADS = 4;
+const unsigned int MAXTHREADS = 4;
 const unsigned int FRAMEBUFFER = 8;
+unsigned int curThreads = MAXTHREADS;
 
 //Kalman filter constants
-const double Q_val = 4e-3; //4e-3 4e-2
-const double R_val = 0.25; //0.25 5
+const double Q_val = 4e-3; //4e-3
+const double R_val = 0.25; //0.25
 RigidTransform Q(Q_val, Q_val, Q_val); // process noise covariance
 RigidTransform R(R_val, R_val, R_val); // measurement noise covariance
 
@@ -193,8 +228,8 @@ cv::VideoWriter output;
 mutex coutLock;
 
 //Threading
-unsigned int threadAnalyzeFrame[THREADS];	//index of frames each ANALYZE thread is processing
-bool threadAnalyzeBusy[THREADS];			//threads busy processing and cannot be respawned
+unsigned int threadAnalyzeFrame[MAXTHREADS];	//index of frames each ANALYZE thread is processing
+bool threadAnalyzeBusy[MAXTHREADS];			//threads busy processing and cannot be respawned
 unsigned int frameAnalyzing = 0;			//current frame being analyzed
 unsigned int framesAnalyzed = -1;			//last frame to be analyzed
 unsigned int frameStabilizing = 0;			//current frame being stabilized
@@ -204,7 +239,7 @@ bool terminated = false;					//when true, all threads are done
 
 RigidTransform framesT[FRAMEBUFFER];			//parsed frame transformation deltas
 AnalysisResults dataT[FRAMEBUFFER];				//parsed analysis results
-cv::Mat frames[FRAMEBUFFER];						//an actual frame buffer between stab and write threads
+cv::Mat frames[FRAMEBUFFER];					//an actual frame buffer between stab and write threads
 RigidTransform X, P, K;							//Kalman filter global variables
 
 static void wait(int micros)
@@ -212,7 +247,8 @@ static void wait(int micros)
 	this_thread::sleep_for(std::chrono::microseconds(micros));
 }
 
-void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis)
+void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis,
+	double stability, unsigned int frame, unsigned int frameCount)
 {
 	//Draw some neat debug info
 	for (size_t i = 0; i < analysis.keypointPrev.size(); i++)
@@ -228,19 +264,50 @@ void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis)
 	after.copyTo(canvas(cv::Range::all(), cv::Range(before.cols + 10, before.cols * 2 + 10)));
 
 	//Help info
-	cv::putText(canvas, cv::String("Before"), cv::Point(8, 48), cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
-	cv::putText(canvas, cv::String("After"), cv::Point(8 + (canvas.cols / 2), 48), cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
+	cv::putText(canvas, cv::String("Before"), cv::Point(8, 48),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
+	cv::putText(canvas, cv::String("After"), cv::Point(8 + (canvas.cols / 2), 48),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 1.5, CV_RGB(255, 255, 255), 3);
 
 	//Scale canvas if too big
-	if (canvas.cols > 1920) {
-		resize(canvas, canvas, cv::Size(canvas.cols / 2, canvas.rows / 2));
+	#ifdef WINDOWS
+	while (canvas.cols > GetDesktopResolution().width) {
+		resize(canvas, canvas, cv::Size(GetDesktopResolution().width - 16, 
+			(int)((double)(GetDesktopResolution().width - 16) * ((double)canvas.rows / (double)canvas.cols))));
 	}
+	#else
+	if (canvas.cols > 1920) {
+		resize(canvas, canvas, cv::Size(canvas.cols / 2, canvas.cols / 2));
+	}
+	#endif
 
 	//Recalculate fps
-	cv::putText(canvas, cv::String(to_string_with_precision(avgfps())) + cv::String(" FPS"), cv::Point(8, canvas.rows - 8),
+	cv::putText(canvas, cv::String(to_string_with_precision(avgfps())) + cv::String(" FPS using ")
+		+ cv::String(to_string_with_precision(curThreads, 0)) + cv::String(" threads"), cv::Point(8, canvas.rows - 8),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
+	//Write frame number
+	int baseline;
+	cv::Size textSize = cv::getTextSize(cv::String("Frame ") + cv::String(to_string_with_precision((int)frame, 0))
+		+ cv::String(" of ") + cv::String(to_string_with_precision((int)frameCount, 0)),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, 2, &baseline);
+	cv::putText(canvas, cv::String("Frame ") + cv::String(to_string_with_precision((int)frame, 0))
+		+ cv::String(" of ") + cv::String(to_string_with_precision((int)frameCount, 0)),
+		cv::Point((canvas.cols / 2) - 8 - textSize.width, canvas.rows - 8),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
+	//Display stability
+	cv::putText(canvas, cv::String("Motion: ") + cv::String(to_string_with_precision(100.0 - stability)) + cv::String("%"),
+		cv::Point(8 + (canvas.cols / 2), canvas.rows - 8),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
+	//Display video size
+	textSize = cv::getTextSize(cv::String("Video Size: ") + cv::String(to_string_with_precision(before.cols, 0))
+		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0)),
+		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, 2, &baseline);
+	cv::putText(canvas, cv::String("Video Size: ") + cv::String(to_string_with_precision(before.cols, 0))
+		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0)),
+		cv::Point((canvas.cols) - 8 - textSize.width, canvas.rows - 8),
 		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
 
-	cv::imshow("Video stabilization demonstration", canvas);
+	cv::imshow("Video Stabilization", canvas);
 	cv::waitKey(1);
 }
 
@@ -367,13 +434,13 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& 
 
 //Kalman filter
 cv::KalmanFilter filter;
-//transition state matrix A
-const float A[] = { 1, 1, 0, 1 };
+cv::Mat state, process_noise, measurement;
+const unsigned int KALMAN_DIM = 3;
 
 void initKalman() 
 {
 	//Create Kalman filter
-	filter = cv::KalmanFilter(3, 1, 0, CV_32F);
+	filter = cv::KalmanFilter(KALMAN_DIM, 3, 0, CV_32F); //(x, y, angle)
 	//process noise covariance
 	cv::setIdentity(filter.processNoiseCov, cv::Scalar(Q_val));
 	//measurement noise covariance
@@ -382,6 +449,12 @@ void initKalman()
 	cv::setIdentity(filter.errorCovPost, cv::Scalar(1));
 	//initialize measurement matrix
 	cv::setIdentity(filter.measurementMatrix, cv::Scalar(1.0));
+	//initialize a posteriori state (initial state)
+	cv::setIdentity(filter.statePost, cv::Scalar(0));
+
+	state = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
+	process_noise = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
+	measurement = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
 }
 
 /*
@@ -391,42 +464,33 @@ This method is guaranteed to run in series (i.e. all frames in order, and one at
 As such, this method should run as quickly as possible. Offload any processing possible
 to analyzeFrame();
 */
-void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, cv::Mat& mat)
+double stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, cv::Mat& mat)
 {
 	//Kalman filter local variables
-	RigidTransform P_, X_;
 	//t_i = instantaneous difference
-	//Z = overall sum
+	//Z = overall sum (measurement)
 
 	//Predict (a priori)
-	cv::Mat prediction = filter.predict();
-	cout << prediction;
+	const cv::Mat prediction = filter.predict(); //(x, y, angle)
 
-	//Update (a posteriori)
-	cv::Mat data = filter.correct(t_i.makeMatrix());
-	cout << data;
+	//Set measurement
+	measurement = (Z - t_i).makeVector(); //improve rolling shutter by taking previous frame
+	//Correct (a posteriori)
+	const cv::Mat target = filter.correct(measurement);
+	const RigidTransform X = RigidTransform(target.at<float>(0,0), target.at<float>(1,0), target.at<float>(2,0));
 
 	//X		= posteriori state estimate (i.e. result of calculation)
-	//X_	= priori state estimate
-	//P		= posteriori estimate error covariance
-	//P_	= priori estiate error covariance
-	//K		= gain
 	//Z		= current measurement
 
-	//Update Kalman filter predictions
-	X_ = X;									//X_(k) = X(k-1);
-	P_ = P + Q;								//P_(k) = P(k-1)+Q;
+	//Compensate: target - current = compensation (X - Z, t_i + X - Z)
+	RigidTransform dT = X - Z;
 
-	//Measurement correction
-	K = P_ / (P_ + R);						//K(k) = P_(k)/( P_(k)+R );
-	X = X_ + K*(Z - X_);					//z-X_ is residual, X(k) = X_(k)+K(k)*(z(k)-X_(k));
-	P = (RigidTransform(1, 1, 1) - K)*P_;	//P(k) = (1-K(k))*P_(k);
-
-	//Compensate: now + (target - current)
-	RigidTransform dT = t_i + X - Z;
+	//Estimate stability
+	RigidTransform _stability = dT - t_i;
+	double stability = _stability.norm() != 0 ? 100.0 / (log10(_stability.norm() + 10.0)) : 100.0;
 
 	//Calculate transform matrix
-	cv::Mat T = dT.makeMatrix();
+	cv::Mat T = dT.makeTransformationMatrix();
 
 	//Transform (stabilize) frame
 	cv::Mat out;
@@ -440,6 +504,8 @@ void stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform
 
 	//Copy frame to write buffer
 	frames[frame % FRAMEBUFFER] = out.clone();
+
+	return stability;
 }
 
 void stabilizeFrames(const unsigned int frameCount)
@@ -453,7 +519,7 @@ void stabilizeFrames(const unsigned int frameCount)
 		int minFrameAnalyzing = INT_MAX;
 		bool frameDone = false;
 		bool allDone = true;
-		for (unsigned int t = 0; t < THREADS; t++)
+		for (unsigned int t = 0; t < MAXTHREADS; t++)
 		{
 			if (threadAnalyzeBusy[t])
 				allDone = false;
@@ -484,11 +550,11 @@ void stabilizeFrames(const unsigned int frameCount)
 			sum += framesT[frameStabilizing % FRAMEBUFFER];
 
 			//Stabilize frame - run *quickly*
-			stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
+			double stability = stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
 				sum, tmp);
 
 			//Draw the image on screen
-			display(tmp, frames[frameStabilizing % FRAMEBUFFER], dataT[frameStabilizing % FRAMEBUFFER]);
+			display(tmp, frames[frameStabilizing % FRAMEBUFFER], dataT[frameStabilizing % FRAMEBUFFER], stability, frameStabilizing, frameCount);
 
 			//Prepare for another to spawn
 			frameStabilizing++;
@@ -540,8 +606,8 @@ void startThreads()
 	initKalman();
 
 	//Prepare threading
-	thread analysisThreads[THREADS];
-	for (size_t i = 0; i < THREADS; i++)
+	thread analysisThreads[MAXTHREADS];
+	for (size_t i = 0; i < MAXTHREADS; i++)
 	{
 		threadAnalyzeBusy[i] = false;	//clear this flag so threads can spin up
 	}
@@ -558,10 +624,12 @@ void startThreads()
 	//Start frame writer
 	thread writeThread = thread(writeFrames, frameCount);
 
+	unsigned int curMaxThread = 0;
+
 	//Run all threads until everything is written
 	while ((frameStabilizing < frameCount) && running)
 	{
-		for (int t = 0; t < THREADS; t++)
+		for (int t = 0; t < MAXTHREADS; t++)
 		{
 			//Check on analysis threads
 			//Make sure that the thread is not busy AND more frames are left to analyze AND
@@ -584,6 +652,17 @@ void startThreads()
 				coutLock.lock();
 				cout << "Analyzing   frame " << frameAnalyzing << " (thread " << t << ")" << endl;
 				coutLock.unlock();
+
+				//Check how many threads we are using once in a while
+				if ((frameAnalyzing % MAXTHREADS * 4) >= MAXTHREADS * 1 && (frameAnalyzing % MAXTHREADS * 4) <= MAXTHREADS * 3)
+				{
+					curMaxThread = max(curMaxThread, t);
+				}
+				if ((frameAnalyzing % MAXTHREADS * 4) == MAXTHREADS * 3)
+				{
+					curThreads = curMaxThread + 1;
+					curMaxThread = 0;
+				}
 
 				//Spawn new analysis thread
 				t1 = tmp.clone();
@@ -608,7 +687,7 @@ void startThreads()
 		stabThread.join();
 	if (writeThread.joinable())
 		writeThread.join();
-	for (size_t i = 0; i < THREADS; i++)
+	for (size_t i = 0; i < MAXTHREADS; i++)
 	{
 		if (analysisThreads[i].joinable())
 			analysisThreads[i].join();
@@ -649,14 +728,8 @@ int main(int argc, char** argv)
 {
 	if (argc < 3)
 	{
-		cout << "./videostab (options) (data.csv) [input.mp4] [output.mp4]" << endl;
-		// cout << endl;
-		// cout << "TRANSFORM OPTIONS" << endl;
-		// cout << "-S (-prsh)  Similarity Transform (Position, Rotation, Scale, sHear)" << endl;
-		// cout << endl;
-		// cout << "RENDERING OPTIONS" << endl;
-		// cout << "-G          Use GPU (default=no)" << endl;
-		// cout << "-Tn         Use n threads (default=4)" << endl;
+		cout << "videostab [-c] input_file output_file" << endl << endl;
+		cout << "Choose Codec (-c): Show manual codec selection if available" << endl;
 	}
 
 	//Catch escape signals
@@ -665,15 +738,15 @@ int main(int argc, char** argv)
 	signal(SIGINT, &handleSignal);
 
 	//Prepare input video streams
-	inputAnalyze = cv::VideoCapture(argv[1]);
+	inputAnalyze = cv::VideoCapture(argv[argc-2]);
 	assert(inputAnalyze.isOpened());
 
-	inputStabilize = cv::VideoCapture(argv[1]);
+	inputStabilize = cv::VideoCapture(argv[argc-2]);
 	assert(inputStabilize.isOpened());
 
-	//Prepare output video stream
-	output = cv::VideoWriter(argv[2],
-		CV_FOURCC('D', 'I', 'V', 'X'),
+	//Prepare video ; stream
+	output = cv::VideoWriter(argv[argc-1],
+		cmdOptionExists(argv, argv+argc, "-c") ? -1 : CV_FOURCC('D', 'I', 'V', 'X'),
 		inputAnalyze.get(CV_CAP_PROP_FPS),
 		cv::Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
 			inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT)));
