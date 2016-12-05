@@ -198,16 +198,55 @@ struct AnalysisResults
 public:
 	vector <cv::Point2f> keypointPrev;
 	vector <cv::Point2f> keypointCur;
+	double analysisTime;
+	unsigned int thread;
 
-	AnalysisResults() 
+	AnalysisResults()
 	{
 		keypointPrev = vector<cv::Point2f>();
 		keypointCur = vector<cv::Point2f>();
+		analysisTime = 0.0;
+		this->thread = 0;
 	}
-	AnalysisResults(vector<cv::Point2f> keypointPrev, vector<cv::Point2f> keypointCur)
+	AnalysisResults(unsigned int thread) 
+	{
+		keypointPrev = vector<cv::Point2f>();
+		keypointCur = vector<cv::Point2f>();
+		analysisTime = 0.0;
+		this->thread = thread;
+	}
+	AnalysisResults(vector<cv::Point2f> keypointPrev, vector<cv::Point2f> keypointCur, double analysisTime, unsigned int thread)
 	{
 		this->keypointPrev = keypointPrev;
 		this->keypointCur = keypointCur;
+		this->analysisTime = analysisTime;
+		this->thread = thread;
+	}
+};
+
+struct StabilizationResults
+{
+public:
+	RigidTransform stateEstimatePriori, stateEstimatePosteriori, measurementResidual, frameCompensation, frameDifference, frameUncorrectedState;
+	float errorCovariancePriori, errorCovariancePosteriori, residualCovariance, optimalKalmanGain, stabilityIndex;
+	double stabilizationTime;
+
+	StabilizationResults(RigidTransform stateEstPre, RigidTransform stateEstPost, RigidTransform measurementResidual, 
+		RigidTransform frameCompensation, RigidTransform frameDifference, RigidTransform frameUncorrectedState,
+		float errorCovPre, float errorCovPost, float residCovar, float gain, float stability, double stabilizationTime)
+	{
+		this->stateEstimatePriori = stateEstPre;
+		this->stateEstimatePosteriori = stateEstPost;
+		this->measurementResidual = measurementResidual;
+		this->frameCompensation = frameCompensation;
+		this->frameDifference = frameDifference;
+		this->frameUncorrectedState = frameUncorrectedState;
+		this->errorCovariancePriori = errorCovPre;
+		this->errorCovariancePosteriori = errorCovPost;
+		this->residualCovariance = residCovar;
+		this->optimalKalmanGain = gain;
+		this->stabilityIndex = stability;
+		this->stabilizationTime = stabilizationTime;
 	}
 };
 
@@ -226,16 +265,19 @@ cv::VideoCapture inputAnalyze;
 cv::VideoCapture inputStabilize;
 cv::VideoWriter output;
 mutex coutLock;
+ofstream csv;
+double videoFps;
+bool flipVideoHorizontal;
 
 //Threading
 unsigned int threadAnalyzeFrame[MAXTHREADS];	//index of frames each ANALYZE thread is processing
-bool threadAnalyzeBusy[MAXTHREADS];			//threads busy processing and cannot be respawned
-unsigned int frameAnalyzing = 0;			//current frame being analyzed
-unsigned int framesAnalyzed = -1;			//last frame to be analyzed
-unsigned int frameStabilizing = 0;			//current frame being stabilized
-unsigned int frameWriting = 0;				//current frame being written
-bool running = true;						//when false, begin termination
-bool terminated = false;					//when true, all threads are done
+bool threadAnalyzeBusy[MAXTHREADS];				//threads busy processing and cannot be respawned
+unsigned int frameAnalyzing = 0;				//current frame being analyzed
+unsigned int framesAnalyzed = -1;				//last frame to be analyzed
+unsigned int frameStabilizing = 0;				//current frame being stabilized
+unsigned int frameWriting = 0;					//current frame being written
+bool running = true;							//when false, begin termination
+bool terminated = false;						//when true, all threads are done
 
 RigidTransform framesT[FRAMEBUFFER];			//parsed frame transformation deltas
 AnalysisResults dataT[FRAMEBUFFER];				//parsed analysis results
@@ -247,8 +289,8 @@ static void wait(int micros)
 	this_thread::sleep_for(std::chrono::microseconds(micros));
 }
 
-void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis,
-	double stability, unsigned int frame, unsigned int frameCount)
+void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis, StabilizationResults& stabilization,
+	unsigned int frame, unsigned int frameCount)
 {
 	//Draw some neat debug info
 	for (size_t i = 0; i < analysis.keypointPrev.size(); i++)
@@ -259,6 +301,12 @@ void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis,
 
 	//Draw the original and stablized iamges side-by-side
 	cv::Mat canvas = cv::Mat::zeros(before.rows, before.cols * 2 + 10, before.type());
+
+	if (flipVideoHorizontal)
+	{
+		cv::flip(before, before, 0);
+		cv::flip(after, after, 0);
+	}
 
 	before.copyTo(canvas(cv::Range::all(), cv::Range(0, before.cols)));
 	after.copyTo(canvas(cv::Range::all(), cv::Range(before.cols + 10, before.cols * 2 + 10)));
@@ -295,20 +343,37 @@ void display(cv::Mat& before, cv::Mat& after, AnalysisResults& analysis,
 		cv::Point((canvas.cols / 2) - 8 - textSize.width, canvas.rows - 8),
 		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
 	//Display stability
-	cv::putText(canvas, cv::String("Motion: ") + cv::String(to_string_with_precision(100.0 - stability)) + cv::String("%"),
+	cv::putText(canvas, cv::String("Error Covariance: ") + cv::String(to_string_with_precision(stabilization.errorCovariancePosteriori)),
 		cv::Point(8 + (canvas.cols / 2), canvas.rows - 8),
 		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
 	//Display video size
 	textSize = cv::getTextSize(cv::String("Video Size: ") + cv::String(to_string_with_precision(before.cols, 0))
-		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0)),
+		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0))
+		+ cv::String(" @ ") + cv::String(to_string_with_precision(videoFps, 0)) + cv::String(" fps"),
 		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, 2, &baseline);
 	cv::putText(canvas, cv::String("Video Size: ") + cv::String(to_string_with_precision(before.cols, 0))
-		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0)),
+		+ cv::String("x") + cv::String(to_string_with_precision(before.rows, 0))
+		+ cv::String(" @ ") + cv::String(to_string_with_precision(videoFps, 0)) + cv::String(" fps"),
 		cv::Point((canvas.cols) - 8 - textSize.width, canvas.rows - 8),
 		cv::HersheyFonts::FONT_HERSHEY_SIMPLEX, 0.5, CV_RGB(255, 255, 255), 2);
 
 	cv::imshow("Video Stabilization", canvas);
 	cv::waitKey(1);
+
+	//Write some info to the csv
+	if (csv.is_open())
+	{
+		csv << frame << "," << to_string_with_precision((double)frame / videoFps) << "," << to_string_with_precision(analysis.analysisTime) << "," <<
+			analysis.thread << "," << stabilization.stabilizationTime << "," << analysis.keypointCur.size() << "," <<
+			stabilization.frameDifference.x << "," << stabilization.frameDifference.y << "," << stabilization.frameDifference.angle << "," <<
+			stabilization.frameUncorrectedState.x << "," << stabilization.frameUncorrectedState.y << "," << stabilization.frameUncorrectedState.angle << "," <<
+			stabilization.stateEstimatePriori.x << "," << stabilization.stateEstimatePriori.y << "," << stabilization.stateEstimatePriori.angle << "," <<
+			stabilization.stateEstimatePosteriori.x << "," << stabilization.stateEstimatePosteriori.y << "," << stabilization.stateEstimatePosteriori.angle << "," <<
+			stabilization.frameCompensation.x << "," << stabilization.frameCompensation.y << "," << stabilization.frameCompensation.angle << "," <<
+			stabilization.measurementResidual.x << "," << stabilization.measurementResidual.y << "," << stabilization.measurementResidual.angle << "," <<
+			stabilization.errorCovariancePriori << "," << stabilization.errorCovariancePosteriori << "," <<
+			stabilization.residualCovariance << "," << stabilization.optimalKalmanGain << "," << stabilization.stabilityIndex << endl;
+	}
 }
 
 static cv::Mat fisheyeCorrection(cv::Mat& src)
@@ -357,6 +422,7 @@ static cv::Mat fisheyeCorrection(cv::Mat& src)
 void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& mat, cv::Mat& prevMat) noexcept
 {
 	const int id = frame % FRAMEBUFFER;
+	double _start = CLOCK();
 
 	cv::Mat grayCur, grayPrev;
 	cv::cvtColor(mat, grayCur, cv::COLOR_BGR2GRAY);
@@ -380,7 +446,7 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& 
 
 	//Output
 	RigidTransform dT(0, 0, 0);
-	AnalysisResults results = AnalysisResults();
+	AnalysisResults results = AnalysisResults(thread);
 
 	if (_keypointPrev.size() > 0)
 	{
@@ -425,6 +491,7 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& 
 
 	//Finalize output
 	framesT[id] = dT;
+	results.analysisTime = (CLOCK() - _start) / 1000.0;
 	dataT[id] = results;
 
 	//Prepare for another thread
@@ -434,11 +501,13 @@ void analyzeFrame(const unsigned int frame, const unsigned int thread, cv::Mat& 
 
 //Kalman filter
 cv::KalmanFilter filter;
-cv::Mat state, process_noise, measurement;
+cv::Mat measurement;
 const unsigned int KALMAN_DIM = 3;
 
 void initKalman() 
 {
+	//Note: all data uses floats for speed improvement
+
 	//Create Kalman filter
 	filter = cv::KalmanFilter(KALMAN_DIM, 3, 0, CV_32F); //(x, y, angle)
 	//process noise covariance
@@ -452,8 +521,8 @@ void initKalman()
 	//initialize a posteriori state (initial state)
 	cv::setIdentity(filter.statePost, cv::Scalar(0));
 
-	state = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
-	process_noise = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
+	//state = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
+	//process_noise = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
 	measurement = cv::Mat(KALMAN_DIM, 1, CV_32FC1);
 }
 
@@ -464,40 +533,67 @@ This method is guaranteed to run in series (i.e. all frames in order, and one at
 As such, this method should run as quickly as possible. Offload any processing possible
 to analyzeFrame();
 */
-double stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransform Z, cv::Mat& mat)
+StabilizationResults stabilizeFrame(const unsigned int frame, RigidTransform frameDiff, RigidTransform frameState, cv::Mat& mat)
 {
-	//Kalman filter local variables
-	//t_i = instantaneous difference
-	//Z = overall sum (measurement)
+	double _start = CLOCK();
 
+	//Input:
+	//frameDiff = instantaneous difference
+	//frameState = overall sum (measurement)
+	
 	//Predict (a priori)
-	const cv::Mat prediction = filter.predict(); //(x, y, angle)
+	const cv::Mat prediction = filter.predict();					//(x, y, angle)
+	float errorCovPre = filter.errorCovPre.at<float>(0, 0);			//a priori error covariance
+	RigidTransform stateEstPre = RigidTransform(prediction.at<float>(0, 0),
+		prediction.at<float>(1, 0), prediction.at<float>(2, 0));	//predicted state estimate
 
 	//Set measurement
-	measurement = (Z - t_i).makeVector(); //improve rolling shutter by taking previous frame
+	//improve rolling shutter by taking previous frame instead of current frame
+	measurement = (frameState - frameDiff).makeVector(); 
+
 	//Correct (a posteriori)
 	const cv::Mat target = filter.correct(measurement);
-	const RigidTransform X = RigidTransform(target.at<float>(0,0), target.at<float>(1,0), target.at<float>(2,0));
+	float gain = filter.gain.at<float>(0, 0);							//optimal Kalman gain
+	float errorCovPost = filter.errorCovPost.at<float>(0, 0);			//a posteriori error covariance
+	RigidTransform stateEstPost = RigidTransform(target.at<float>(0, 0),
+		target.at<float>(1, 0), target.at<float>(2, 0));				//a posteriori state estimate
+	RigidTransform measurementResidual = RigidTransform(filter.temp5.at<float>(0, 0),
+		filter.temp5.at<float>(1, 0), filter.temp5.at<float>(2, 0));	//measurement residual
+	float residCovar = filter.temp3.at<float>(0, 0);					//residual covariance
 
-	//X		= posteriori state estimate (i.e. result of calculation)
-	//Z		= current measurement
+	/*#define TESTMAT filter.errorCovPost
+	float a1 = TESTMAT.at<float>(0, 0);
+	float a2 = TESTMAT.at<float>(0, 1);
+	float a3 = TESTMAT.at<float>(0, 2);
+	float b1 = TESTMAT.at<float>(1, 0);
+	float b2 = TESTMAT.at<float>(1, 1);
+	float b3 = TESTMAT.at<float>(1, 2);
+	float c1 = TESTMAT.at<float>(2, 0);
+	float c2 = TESTMAT.at<float>(2, 1);
+	float c3 = TESTMAT.at<float>(2, 2);
+	float m[9] = { a1, a2, a3, b1, b2, b3, c1, c2, c3 };	
+	cout << m << endl;*/
 
-	//Compensate: target - current = compensation (X - Z, t_i + X - Z)
-	RigidTransform dT = X - Z;
+	//Output:
+	//stateEstPost		= posteriori state estimate (i.e. result of calculation)
+	//frameState		= current measurement
+
+	//Compensate: target - current = compensation (stateEstPost - frameState, frameDiff + stateEstPost - frameState)
+	RigidTransform frameCompensation = stateEstPost - frameState;
 
 	//Estimate stability
-	RigidTransform _stability = dT - t_i;
+	RigidTransform _stability = frameCompensation - frameDiff;
 	double stability = _stability.norm() != 0 ? 100.0 / (log10(_stability.norm() + 10.0)) : 100.0;
 
 	//Calculate transform matrix
-	cv::Mat T = dT.makeTransformationMatrix();
+	cv::Mat T = frameCompensation.makeTransformationMatrix();
 
 	//Transform (stabilize) frame
 	cv::Mat out;
 	cv::warpAffine(mat, out, T, mat.size());
 	//Perform fisheye correction
 	//out = fisheyeCorrection(out);
-
+	
 	//Wait until our framebuffer has an empty slot
 	while (frame + FRAMEBUFFER - 1 <= frameStabilizing)
 		wait(1);
@@ -505,7 +601,8 @@ double stabilizeFrame(const unsigned int frame, RigidTransform t_i, RigidTransfo
 	//Copy frame to write buffer
 	frames[frame % FRAMEBUFFER] = out.clone();
 
-	return stability;
+	return StabilizationResults(stateEstPre, stateEstPost, measurementResidual, frameCompensation, frameDiff, frameState,
+		errorCovPre, errorCovPost, residCovar, gain, stability, (CLOCK() - _start)/1000.0);
 }
 
 void stabilizeFrames(const unsigned int frameCount)
@@ -550,11 +647,11 @@ void stabilizeFrames(const unsigned int frameCount)
 			sum += framesT[frameStabilizing % FRAMEBUFFER];
 
 			//Stabilize frame - run *quickly*
-			double stability = stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
+			StabilizationResults stabResults = stabilizeFrame(frameStabilizing, framesT[frameStabilizing % FRAMEBUFFER],
 				sum, tmp);
 
 			//Draw the image on screen
-			display(tmp, frames[frameStabilizing % FRAMEBUFFER], dataT[frameStabilizing % FRAMEBUFFER], stability, frameStabilizing, frameCount);
+			display(tmp, frames[frameStabilizing % FRAMEBUFFER], dataT[frameStabilizing % FRAMEBUFFER], stabResults, frameStabilizing, frameCount);
 
 			//Prepare for another to spawn
 			frameStabilizing++;
@@ -654,11 +751,11 @@ void startThreads()
 				coutLock.unlock();
 
 				//Check how many threads we are using once in a while
-				if ((frameAnalyzing % MAXTHREADS * 4) >= MAXTHREADS * 1 && (frameAnalyzing % MAXTHREADS * 4) <= MAXTHREADS * 3)
+				if ((frameAnalyzing % MAXTHREADS * 5) <= MAXTHREADS * 3)
 				{
 					curMaxThread = max(curMaxThread, t);
 				}
-				if ((frameAnalyzing % MAXTHREADS * 4) == MAXTHREADS * 3)
+				if ((frameAnalyzing % MAXTHREADS * 5) == MAXTHREADS * 3)
 				{
 					curThreads = curMaxThread + 1;
 					curMaxThread = 0;
@@ -728,9 +825,13 @@ int main(int argc, char** argv)
 {
 	if (argc < 3)
 	{
-		cout << "videostab [-c] input_file output_file" << endl << endl;
+		cout << "videostab [-f] [-c] [-d dataout.csv] input_video output_video" << endl << endl;
 		cout << "Choose Codec (-c): Show manual codec selection if available" << endl;
+		cout << "Output Data  (-d): Output analysis and stabilization data as CSV" << endl;
+		cout << "Flip Stream  (-f): Flip video horizontally for some buggy codecs" << endl;
 	}
+
+	flipVideoHorizontal = cmdOptionExists(argv, argv + argc, "-f");
 
 	//Catch escape signals
 	//signal(SIGABRT, &handleSignal);
@@ -744,13 +845,31 @@ int main(int argc, char** argv)
 	inputStabilize = cv::VideoCapture(argv[argc-2]);
 	assert(inputStabilize.isOpened());
 
-	//Prepare video ; stream
-	output = cv::VideoWriter(argv[argc-1],
-		cmdOptionExists(argv, argv+argc, "-c") ? -1 : CV_FOURCC('D', 'I', 'V', 'X'),
-		inputAnalyze.get(CV_CAP_PROP_FPS),
-		cv::Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
-			inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT)));
+	//Prepare video stream
+	videoFps = inputAnalyze.get(CV_CAP_PROP_FPS);
+	cv::Size videoSize = cv::Size(inputAnalyze.get(CV_CAP_PROP_FRAME_WIDTH),
+		inputAnalyze.get(CV_CAP_PROP_FRAME_HEIGHT));
+    output = cv::VideoWriter(argv[argc-1],
+	cmdOptionExists(argv, argv+argc, "-c") ? -1 : CV_FOURCC('D', 'I', 'V', 'X'), videoFps, videoSize);
 	assert(output.isOpened());
+
+	if (argc >= 4 && sizeof(argv[argc - 3]) / sizeof(char) > 3)
+	{
+		csv = ofstream(argv[argc - 3]);
+		assert(csv.is_open());
+		csv << "Video Width," << videoSize.width << endl
+			<< "Video Height," << videoSize.height << endl
+			<< "Video FPS" << videoFps << endl
+			<< "Input Filename" << argv[argc - 2] << endl << endl;
+		csv << "Frame,Video Time,Analysis Time,Analysis Thread,Stabilization Time,Keypoints Found," <<
+			"Delta X,Delta Y,Delta Theta,Uncorrected X,Uncorrected Y,Uncorrected Theta," <<
+			"State Estimate Priori X,State Estimate Priori Y,State Estimate Priori Theta," <<
+			"Corrected X (State Estimate Posteriori),Corrected Y (State Estimate Posteriori),Corrected Theta (State Estimate Posteriori)," <<
+			"Compensation X,Compensation Y,Compensation Theta," <<
+			"Measurement Residual X,Measurement Residual Y,Measurement Residual Theta," <<
+			"Error Covariance Priori P(k|k-1),Error Covariance Posteriori P(k|k)," <<
+			"Residual Covariance (S),Optimal Kalman Gain (K),Stability Index (%)" << endl;
+	}
 
 	//Main operation
 	startThreads();
@@ -760,5 +879,6 @@ int main(int argc, char** argv)
 	inputAnalyze.release();
 	inputStabilize.release();
 	output.release();
+	csv.close();
 	return 0;
 }
